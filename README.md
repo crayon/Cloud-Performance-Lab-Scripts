@@ -27,6 +27,16 @@ pwsh -File ./amd_metrics_availability_assessment_1.3.ps1
 On first run the script installs `Az.Accounts`, `Az.Compute`, and `Az.Monitor` to your user
 profile. This downloads roughly 600 MB and can take several minutes — that's normal.
 
+> **Stricter change-control environments:** the auto-install runs `Install-Module` from the
+> PowerShell Gallery and briefly sets PSGallery as a trusted repository for the current user.
+> If your organisation restricts software installation or external package sources, review
+> the modules and install them separately ahead of time under an approved process, then run
+> with `-SkipModuleCheck` so the script performs no installation:
+> ```powershell
+> Install-Module Az.Accounts, Az.Compute, Az.Monitor -Scope CurrentUser
+> pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -SkipModuleCheck
+> ```
+
 Common variants:
 
 ```powershell
@@ -55,7 +65,52 @@ Three timestamped files are written to `-OutputPath`:
 
 - `VM_Metrics_yyyyMMdd_HHmmss.csv` — one row per VM with sizing, CPU, memory, network, disk, IOPS.
 - `VM_Availability_yyyyMMdd_HHmmss.csv` — only with `-IncludeAvailability`.
-- `VM_Assessment_yyyyMMdd_HHmmss.log` — full transcript of the run. Send this if you need help diagnosing a failure.
+- `VM_Assessment_yyyyMMdd_HHmmss.log` — full transcript of the run. Send this if you need help diagnosing a failure. **Review and sanitise this before sharing** — see the note below.
+
+> **Transcript may contain sensitive details.** The `.log` is a verbatim transcript of the
+> console session, so beyond the data in the CSVs it can capture the signed-in account
+> identity (UPN / email), tenant and subscription IDs and names, every in-scope resource
+> group and VM name, the output path (which may include a local username), and raw Azure
+> error messages — which sometimes include role-assignment details, principal IDs, or
+> resource paths. None of it is workload or guest data, but treat the file as internal.
+> Open it, review the contents, and redact anything your organisation considers sensitive
+> before sending it on.
+
+## Data collected
+
+The script reads Azure Resource Manager metadata and Azure Monitor metrics only. It does **not**
+read into guest operating systems, application data, file contents, or any customer workload data.
+Every field below is written to the CSVs in plain text.
+
+**`VM_Metrics_*.csv`**
+
+| Field | Description |
+|---|---|
+| `SubscriptionName` | Display name of the subscription |
+| `SubscriptionId` | Subscription GUID |
+| `ResourceGroup` | Resource group the VM belongs to |
+| `VMName` | VM resource name |
+| `Location` | Azure region |
+| `VMSize` | VM SKU (e.g. `Standard_D4s_v5`) |
+| `PowerState` | Running / deallocated / stopped / unknown |
+| `OSType` | Windows or Linux (from the OS disk profile) |
+| `MaxCPUPercent`, `AvgCPUPercent` | Peak and average CPU utilisation over the window |
+| `TotalCPUCores` | vCPU count for the SKU |
+| `MaxMemoryUsedGiB`, `AvgMemoryUsedGiB` | Peak and average memory used (requires Azure Monitor Agent) |
+| `TotalAllocatedMemoryGiB` | Memory allocated to the SKU |
+| `MaxNetworkBandwidthMbps` | Peak combined in/out network throughput (estimated) |
+| `MaxDiskBandwidthPercent` | Peak OS disk bandwidth consumed as a percentage of the cap |
+| `MaxIOPSPercent` | Peak OS disk IOPS consumed as a percentage of the cap |
+| `CollectionPeriodDays`, `CollectionStartDate`, `CollectionEndDate` | The look-back window used for the run |
+
+**`VM_Availability_*.csv`** (only with `-IncludeAvailability`)
+
+| Field | Description |
+|---|---|
+| `SubscriptionName`, `SubscriptionId`, `ResourceGroup`, `VMName`, `Location`, `PowerState` | Same identifiers as above |
+| `AvailabilityPercent` | Availability over the window |
+| `UptimeCalculationMethod` | Which source produced the figure (VM Availability metric, Activity Log estimate, or none) |
+| `CollectionPeriodDays`, `CollectionStartDate`, `CollectionEndDate` | The look-back window used for the run |
 
 ## Permissions
 
@@ -123,7 +178,7 @@ Then run with `-SkipModuleCheck` so the script doesn't re-attempt installation.
 That's expected behaviour — per-subscription failures are logged and skipped. Check the `VM_Assessment_*.log` file for the specific message (usually a missing role assignment).
 
 **How do I share results with Crayon?**
-Send the two CSVs and the matching `.log` file from `-OutputPath`. The log is a full transcript so we can reproduce any issue without needing live access.
+Send the two CSVs and the matching `.log` file from `-OutputPath`. The log is a full transcript so we can reproduce any issue without needing live access. Review and sanitise the `.log` first (see [Output](#output)) — it can contain account, tenant, and subscription identifiers.
 
 ## Troubleshooting
 
