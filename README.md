@@ -191,3 +191,13 @@ Send the two CSVs and the matching `.log` file from `-OutputPath`. The log is a 
 - **Empty memory / disk metrics for some VMs** — Azure requires the Azure Monitor agent for guest-level memory and disk metrics. Host-level CPU and network always populate.
 - **`-DaysBack` warning** — Azure caps VM metric retention at 30 days; older days will be empty.
 - **Script feels stuck on first run** — it's downloading the Az modules (~600 MB). Subsequent runs are fast.
+
+## License
+
+Copyright 2026 SoftwareOne AG
+
+This software and associated documentation files (the "Software") is licensed under the Apache License, Version 2.0 (the "License"). You are permitted to use the Software in accordance with the terms of the License. Please see the License for the specific language governing permissions and limitations under the License.
+
+You can obtain a copy of the License at <http://www.apache.org/licenses/LICENSE-2.0>.
+
+THE SOFTWARE DISTRIBUTED UNDER THE LICENSE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
