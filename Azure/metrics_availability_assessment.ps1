@@ -34,11 +34,11 @@
 
 .EXAMPLE
     # macOS / Linux / Windows (PowerShell 7+):
-    pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -DaysBack 30 -IncludeAvailability
+    pwsh -File ./metrics_availability_assessment.ps1 -DaysBack 30 -IncludeAvailability
 
 .EXAMPLE
     # Headless server (no browser):
-    pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -UseDeviceAuthentication
+    pwsh -File ./metrics_availability_assessment.ps1 -UseDeviceAuthentication
 
 .NOTES
     Author: Crayon Group
