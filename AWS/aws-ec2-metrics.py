@@ -20,9 +20,28 @@ Metrics exported:
 - Max IOPS (Ops/sec)
 """
 
+# ---------------------------------------------------------------------------
+# Changes in v2.1 (vs v2.0). No change to prompts, filenames, columns or order.
+#
+# 1. describe_instances is now paginated. Previously it read only the first
+#    page (~1000 instances per region) and silently dropped the remainder.
+#
+# 2. list_metrics is now paginated. Previously it read only the first page
+#    (500 metrics), so instances beyond it falsely reported
+#    "CWAgent not installed" when the agent was in fact running.
+#
+# 3. Output files are now written unconditionally, including when a run finds
+#    no instances. Previously nothing was written, leaving the previous run's
+#    files on disk to be renamed and sent as this account's output.
+# ---------------------------------------------------------------------------
+
+import os
 import boto3
 import pandas as pd
 from datetime import datetime, timedelta
+
+METRICS_FILE = 'instance_metrics.xlsx'
+INVENTORY_FILE = 'instance_inventory.csv'
 
 # ---------------- CloudWatch metric helper ----------------
 def get_metrics(cw_client, namespace, metric_name, dimensions, statistics, period, days):
@@ -51,15 +70,18 @@ def get_metrics(cw_client, namespace, metric_name, dimensions, statistics, perio
 def find_cwagent_dimensions(cw_client, instance_id):
     """Find CloudWatch Agent memory metric dimensions"""
     try:
-        metrics = cw_client.list_metrics(
+        # Paginated: list_metrics returns 500 metrics per page. Without this,
+        # instances beyond the first page falsely report "CWAgent not installed".
+        paginator = cw_client.get_paginator('list_metrics')
+
+        for page in paginator.paginate(
             Namespace='CWAgent',
             MetricName='mem_used_percent'
-        )['Metrics']
-
-        for m in metrics:
-            dims = {d['Name']: d['Value'] for d in m['Dimensions']}
-            if dims.get('InstanceId') == instance_id:
-                return [{'Name': k, 'Value': v} for k, v in dims.items()]
+        ):
+            for m in page['Metrics']:
+                dims = {d['Name']: d['Value'] for d in m['Dimensions']}
+                if dims.get('InstanceId') == instance_id:
+                    return [{'Name': k, 'Value': v} for k, v in dims.items()]
 
         return None
     
@@ -154,12 +176,19 @@ def main():
             continue
 
         try:
-            instances = ec2.describe_instances()
+            # Paginated: describe_instances caps at ~1000 results per page and
+            # returns a NextToken. Without this, larger estates are silently truncated.
+            paginator = ec2.get_paginator('describe_instances')
+            reservations = []
+            for page in paginator.paginate():
+                reservations.extend(page['Reservations'])
         except Exception as e:
             print(f"❌ Error retrieving instances in {REGION}: {e}")
             continue
 
-        for reservation in instances['Reservations']:
+        print(f"  Found {sum(len(r['Instances']) for r in reservations)} instances")
+
+        for reservation in reservations:
             for instance in reservation['Instances']:
 
                 try:
@@ -309,17 +338,23 @@ def main():
 
     # ---------------- Export results ----------------
     try:
+        # Written unconditionally, including when empty. A run that finds nothing
+        # must not leave a previous account's files on disk to be renamed and sent
+        # as this account's output.
+        # Column order comes from the row dict as before, unchanged.
+        pd.DataFrame(results).to_excel(METRICS_FILE, index=False)
+        pd.DataFrame(inventory_rows).to_csv(INVENTORY_FILE, index=False)
+
+        print(f"\n{'='*60}")
         if results:
-            pd.DataFrame(results).to_excel('instance_metrics.xlsx', index=False)
-            pd.DataFrame(inventory_rows).to_csv('instance_inventory.csv', index=False)
-            
-            print(f"\n{'='*60}")
             print(f"✓ SUCCESS: Processed {len(results)} instances")
-            print(f"✓ Metrics saved to: instance_metrics.xlsx")
-            print(f"✓ Inventory saved to: instance_inventory.csv")
-            print(f"{'='*60}\n")
         else:
-            print("\n⚠️  No instances found or all instances failed processing")
+            print("⚠️  NO INSTANCES FOUND, OR ALL INSTANCES FAILED PROCESSING")
+            print("   Empty files have been written so they cannot be mistaken")
+            print("   for output from a previous run. Do not send these.")
+        print(f"✓ Metrics:   {os.path.abspath(METRICS_FILE)}")
+        print(f"✓ Inventory: {os.path.abspath(INVENTORY_FILE)}")
+        print(f"{'='*60}\n")
     
     except Exception as e:
         print(f"\n❌ Error saving results: {e}")

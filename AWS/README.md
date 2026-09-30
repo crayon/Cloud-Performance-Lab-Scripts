@@ -102,8 +102,10 @@ Two files are written to the **current working directory**, with fixed names:
   send back.
 - `instance_inventory.csv`. Inventory-only subset (no metrics).
 
-Both are **overwritten on every run**. Before sending, rename the workbook so it identifies the
-account, for example `instance_metrics_<account-id>.xlsx`.
+Both are **overwritten on every run**, including a run that finds no instances, which writes
+empty files and prints a warning so a previous account's output cannot be mistaken for this
+one. Before sending, rename the workbook so it identifies the account, for example
+`instance_metrics_<account-id>.xlsx`.
 
 ### `instance_metrics.xlsx` columns
 
@@ -176,6 +178,12 @@ SoftwareOne for the data template and the fields to export from it.
 - **Memory needs the CloudWatch Agent** (see above). The script looks for `mem_used_percent` in
   the `CWAgent` namespace with an `InstanceId` dimension. Agents configured with a different
   dimension set, or a custom namespace, are not found.
+- **Agent detection only sees the last two weeks.** CloudWatch lists only metrics that received
+  data in the previous 14 days, so an instance whose agent stopped reporting earlier than that
+  shows as `CWAgent not installed` even though memory data from earlier in the window exists.
+- **Large estates take longer.** Agent detection re-reads the account's full agent metric list
+  for every instance, so runs slow down as the number of instances and agent metrics grows. Both
+  instance and metric listings are paginated, so nothing is dropped.
 - **Disk metrics cover EBS only**, via the instance-level `EBSReadBytes` / `EBSWriteBytes` /
   `EBSReadOps` / `EBSWriteOps` metrics in the `AWS/EC2` namespace. Instance-store volumes are not
   included, and instance types that do not publish these instance-level metrics show `0`.
