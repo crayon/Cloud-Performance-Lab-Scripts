@@ -34,11 +34,11 @@
 
 .EXAMPLE
     # macOS / Linux / Windows (PowerShell 7+):
-    pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -DaysBack 30 -IncludeAvailability
+    pwsh -File ./metrics_availability_assessment.ps1 -DaysBack 30 -IncludeAvailability
 
 .EXAMPLE
     # Headless server (no browser):
-    pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -UseDeviceAuthentication
+    pwsh -File ./metrics_availability_assessment.ps1 -UseDeviceAuthentication
 
 .NOTES
     Author: Crayon Group
@@ -137,7 +137,7 @@ $endTime = Get-Date
 $startTime = $endTime.AddDays(-$DaysBack)
 
 Write-Host "=====================================" -ForegroundColor Cyan
-Write-Host "VM Metrics Collection Script (CSV)" -ForegroundColor Cyan
+Write-Host "VM Metrics Collection Script (CSV) v2.3" -ForegroundColor Cyan
 Write-Host "=====================================" -ForegroundColor Cyan
 Write-Host "Date Range: $($startTime.ToString('yyyy-MM-dd')) to $($endTime.ToString('yyyy-MM-dd'))" -ForegroundColor Yellow
 Write-Host "Days Back: $DaysBack days" -ForegroundColor Yellow

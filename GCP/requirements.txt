@@ -1,0 +1,5 @@
+google-cloud-compute>=1.14
+google-cloud-monitoring>=2.15
+google-cloud-resource-manager>=1.10
+pandas>=2.0
+openpyxl>=3.1
