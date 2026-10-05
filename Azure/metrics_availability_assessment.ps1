@@ -137,7 +137,7 @@ $endTime = Get-Date
 $startTime = $endTime.AddDays(-$DaysBack)
 
 Write-Host "=====================================" -ForegroundColor Cyan
-Write-Host "VM Metrics Collection Script (CSV)" -ForegroundColor Cyan
+Write-Host "VM Metrics Collection Script (CSV) v2.3" -ForegroundColor Cyan
 Write-Host "=====================================" -ForegroundColor Cyan
 Write-Host "Date Range: $($startTime.ToString('yyyy-MM-dd')) to $($endTime.ToString('yyyy-MM-dd'))" -ForegroundColor Yellow
 Write-Host "Days Back: $DaysBack days" -ForegroundColor Yellow

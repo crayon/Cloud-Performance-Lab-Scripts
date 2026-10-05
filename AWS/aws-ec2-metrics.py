@@ -1,5 +1,6 @@
 """
 AWS EC2 CloudWatch Metrics Script
+Version: 2.1
 
 Description:
 - Collects essential CloudWatch metrics for EC2 instances
@@ -21,7 +22,8 @@ Metrics exported:
 """
 
 # ---------------------------------------------------------------------------
-# Changes in v2.1 (vs v2.0). No change to prompts, filenames, columns or order.
+# Changes in v2.1 (this version) vs v2.0. No change to prompts, filenames,
+# columns or order.
 #
 # 1. describe_instances is now paginated. Previously it read only the first
 #    page (~1000 instances per region) and silently dropped the remainder.

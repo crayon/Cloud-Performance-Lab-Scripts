@@ -1,6 +1,7 @@
 """
 ============================================================
  GCP Compute Engine – Instance Metrics Collector (Optimized)
+ Version: 1.0
 ============================================================
 
 Collects comprehensive performance metrics for GCP Compute Engine instances.
