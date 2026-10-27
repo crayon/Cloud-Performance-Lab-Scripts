@@ -593,6 +593,8 @@ foreach ($subscription in $subscriptions) {
                 ImagePublisher            = $vm.StorageProfile.ImageReference.Publisher
                 ImageOffer                = $vm.StorageProfile.ImageReference.Offer
                 ImageSku                  = $vm.StorageProfile.ImageReference.Sku
+                MaxTempDiskIOPS           = $null
+                MaxTempDiskMBps           = $null
             }
 
             # CPU: peak from the per-interval maximum, average and P95 from the 5-minute averages
@@ -699,6 +701,16 @@ foreach ($subscription in $subscriptions) {
             # Temp disk on the current size; Azure cannot resize directly between sizes with and without one
             $tempDiskMB = Get-SkuCapability -SubscriptionId $subscription.Id -Location $vm.Location -VMSize $vm.HardwareProfile.VmSize -Capability 'MaxResourceVolumeMB'
             if ($null -ne $tempDiskMB) { $vmMetrics.TempDiskGiB = [math]::Round([double]$tempDiskMB / 1024, 0) }
+
+            # Temp disk use (e.g. Windows pagefile on D:), so a move to a size without one can be judged
+            if ($vmMetrics.TempDiskGiB -ne 0) {
+                $tempNames = @("Temp Disk Read Operations/Sec", "Temp Disk Write Operations/Sec", "Temp Disk Read Bytes/sec", "Temp Disk Write Bytes/sec")
+                $temp = Get-MetricSeries -ResourceId $vmResourceId -MetricNames $tempNames -StartTime $startTime -EndTime $endTime -Aggregation "Average"
+                $tempIops = Get-SeriesStat -Series @($temp["Temp Disk Read Operations/Sec"], $temp["Temp Disk Write Operations/Sec"]) -Stat Max
+                $tempBytes = Get-SeriesStat -Series @($temp["Temp Disk Read Bytes/sec"], $temp["Temp Disk Write Bytes/sec"]) -Stat Max
+                if ($null -ne $tempIops) { $vmMetrics.MaxTempDiskIOPS = Limit-Value $tempIops -Digits 0 }
+                if ($null -ne $tempBytes) { $vmMetrics.MaxTempDiskMBps = Limit-Value ($tempBytes / 1MB) }
+            }
 
             $metricsResults.Add($vmMetrics) | Out-Null
 
