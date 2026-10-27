@@ -117,6 +117,7 @@ Every field below is written to the CSVs in plain text.
 | `NicCount` | Number of network interfaces |
 | `LicenseType` | Azure Hybrid Benefit licence type, if set |
 | `ImagePublisher`, `ImageOffer`, `ImageSku` | Marketplace image the VM was created from (e.g. SQL Server images) |
+| `MaxTempDiskIOPS`, `MaxTempDiskMBps` | Peak read + write IOPS and MB/s on the temp disk, averaged over 5 minutes; empty when the size has none. Shows whether a move to a size without a temp disk is safe (a Windows pagefile on `D:` shows up here) |
 
 Numbers are always written with a `.` decimal separator, whatever the machine's locale.
 
