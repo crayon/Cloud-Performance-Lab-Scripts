@@ -51,7 +51,7 @@ pwsh -File ./metrics_availability_assessment.ps1 -OutputPath ~/assessments
 
 | Parameter | Default | Description |
 |---|---|---|
-| `-DaysBack` | `30` | Look-back window in days. Azure retains VM metrics for 30 days; values above 30 will produce empty cells for the older portion and the script will warn. |
+| `-DaysBack` | `90` | Look-back window in days (1–90). The default catches month- and quarter-end peaks. Azure Monitor keeps platform metrics for 93 days and returns at most 31 days per query, so longer windows are fetched in 30-day chunks; a shorter window runs faster. |
 | `-OutputPath` | current dir | Where the CSVs and run log are written. Created if it doesn't exist. |
 | `-IncludeAvailability` | off | Also collect VM availability data. |
 | `-TenantId` | current context | Restrict to a specific tenant. |
@@ -120,6 +120,17 @@ Every field below is written to the CSVs in plain text.
 | `MaxTempDiskIOPS`, `MaxTempDiskMBps` | Peak read + write IOPS and MB/s on the temp disk, averaged over 5 minutes; empty when the size has none. Shows whether a move to a size without a temp disk is safe (a Windows pagefile on `D:` shows up here) |
 | `EphemeralOsDisk` | Placement of an ephemeral OS disk (`CacheDisk`, `ResourceDisk` or `NvmeDisk`); empty for a managed OS disk. Changing the size of such a VM wipes and reprovisions its OS disk |
 | `PrivateIPAllocation`, `PublicIPAllocation` | `Static` or `Dynamic` (both, `;`-separated, when the NICs differ); public is empty when the VM has no public IP. A dynamic public IP changes when the VM is stopped, a dynamic private IP when its NIC is replaced |
+| `ProximityPlacementGroup`, `DedicatedHost` | Proximity placement group, and dedicated host group/host; the new size must fit the same hardware |
+| `Priority` | `Spot` for Spot VMs; empty for regular VMs |
+| `CapacityReservationGroup` | Capacity reservation group the VM uses; a reservation for the old size keeps billing after a move |
+| `MarketplacePlan` | `publisher/product` of a third-party marketplace image; such software is often billed per vCPU and certified for specific sizes |
+| `IPForwarding` | `True` when a NIC forwards IP traffic, typical of firewalls and other network virtual appliances |
+| `AcceleratedNetworking` | `True` when a NIC uses accelerated networking; not every size supports it, or with as many NICs |
+| `LoadBalanced` | `True` when a NIC is in a load balancer or Application Gateway backend pool, so the VM is likely one of a set |
+| `SharedDisk` | `True` when a disk is attached to several VMs, typical of failover clusters |
+| `SqlServer`, `SqlAvailabilityGroup` | SQL Server edition and Always On availability group, for VMs registered with the SQL IaaS extension |
+| `ManagedResourceGroup` | Service that owns the VM's resource group (e.g. `Microsoft.Databricks/workspaces/...`); its deny assignment can block a resize |
+| `AllowedSizesPolicy` | `Yes` when the built-in "Allowed virtual machine size SKUs" policy applies; the allowed sizes are printed as a warning. Custom policies are not detected |
 
 Numbers are always written with a `.` decimal separator, whatever the machine's locale.
 
@@ -151,8 +162,10 @@ The signed-in account needs, at minimum:
 - `Microsoft.Compute/disks/read`, `Microsoft.Compute/virtualMachineScaleSets/read` and
   `Microsoft.Compute/skus/read` for the disk, scale set and temp disk columns, and
   `Microsoft.Network/networkInterfaces/read` and `Microsoft.Network/publicIPAddresses/read` for
-  the IP allocation columns. All are part of **Reader**; without them those columns stay empty
-  and the run continues.
+  the network columns, `Microsoft.SqlVirtualMachine/sqlVirtualMachines/read`,
+  `Microsoft.Resources/subscriptions/resourceGroups/read` and
+  `Microsoft.Authorization/policyAssignments/read` for the SQL, managed resource group and policy
+  columns. All are part of **Reader**; without them those columns stay empty and the run continues.
 
 If a subscription is missing access the script logs a warning and continues with the next one
 rather than aborting.
@@ -223,7 +236,6 @@ Send the two CSVs and the matching `.log` file from `-OutputPath`. The log is a 
   Install-Module Az.Accounts, Az.Compute, Az.Monitor -Scope CurrentUser
   ```
 - **Empty memory / disk metrics for some VMs** — Azure requires the Azure Monitor agent for guest-level memory and disk metrics. Host-level CPU and network always populate.
-- **`-DaysBack` warning** — Azure caps VM metric retention at 30 days; older days will be empty.
 - **Upload size warning** — Cloud Performance Lab accepts files up to 5 MB and 10,000 rows. For larger tenants, run the script per subscription (see Q&A) and upload the files together.
 - **Script feels stuck on first run** — it's downloading the Az modules (~600 MB). Subsequent runs are fast.
 

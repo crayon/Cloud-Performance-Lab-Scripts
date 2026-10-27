@@ -8,8 +8,9 @@
     - VM_Availability_yyyyMMdd_HHmmss.csv  (only if -IncludeAvailability)
 
 .PARAMETER DaysBack
-    Number of days to look back for metrics (default: 30)
-    Note: Azure retains metrics data for a maximum of 30 days for look back analysis.
+    Number of days to look back for metrics (default: 90, to catch month- and quarter-end peaks)
+    Note: Azure Monitor keeps platform metrics for 93 days and returns at most 31 days per
+    query, so longer windows are fetched in 30-day chunks.
 
 .PARAMETER OutputPath
     Path for the output CSV files (default: current directory)
@@ -34,7 +35,7 @@
 
 .EXAMPLE
     # macOS / Linux / Windows (PowerShell 7+):
-    pwsh -File ./metrics_availability_assessment.ps1 -DaysBack 30 -IncludeAvailability
+    pwsh -File ./metrics_availability_assessment.ps1 -DaysBack 30 -IncludeAvailability   # shorter window, faster run
 
 .EXAMPLE
     # Headless server (no browser):
@@ -54,7 +55,7 @@
 param(
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 90)]
-    [int]$DaysBack = 30,
+    [int]$DaysBack = 90,
 
     [Parameter(Mandatory = $false)]
     [string]$OutputPath = $PWD.Path,
@@ -106,11 +107,6 @@ if (-not $SkipModuleCheck) {
         Import-Module $module -ErrorAction Stop
         Write-Host "  $module ready." -ForegroundColor Green
     }
-}
-
-# ----- Friendly look-back warning (Azure metrics retention is 30 days) -----
-if ($DaysBack -gt 30) {
-    Write-Warning "Azure VM metrics are retained for 30 days. Values for days older than 30 will be empty."
 }
 
 # Ensures output directory exists
@@ -173,6 +169,20 @@ function Get-MetricSeries {
     )
 
     $result = @{}
+
+    # Azure Monitor returns at most 31 days per query, so longer windows are fetched in 30-day chunks
+    if (($EndTime - $StartTime).TotalDays -gt 30) {
+        for ($chunkStart = $StartTime; $chunkStart -lt $EndTime; $chunkStart = $chunkStart.AddDays(30)) {
+            $chunkEnd = if ($chunkStart.AddDays(30) -lt $EndTime) { $chunkStart.AddDays(30) } else { $EndTime }
+            $chunk = Get-MetricSeries -ResourceId $ResourceId -MetricNames $MetricNames -StartTime $chunkStart -EndTime $chunkEnd -Aggregation $Aggregation
+            foreach ($name in $chunk.Keys) {
+                if (-not $result.ContainsKey($name)) { $result[$name] = @{} }
+                foreach ($ts in $chunk[$name].Keys) { $result[$name][$ts] = $chunk[$name][$ts] }
+            }
+        }
+        return $result
+    }
+
     $maxAttempts = 4
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         try {
@@ -400,6 +410,10 @@ function Connect-AzureSafely {
 try {
     $context = Get-AzContext -ErrorAction Stop
     if (-not $context) { throw "Not connected" }
+    # A saved sign-in can outlive its token (e.g. after MFA expiry); sign in again rather than find no subscriptions
+    if (-not ($TenantId -and $context.Tenant.Id -ne $TenantId)) {
+        $null = Get-AzAccessToken -TenantId $context.Tenant.Id -ErrorAction Stop -WarningAction SilentlyContinue
+    }
 
     if ($TenantId -and $context.Tenant.Id -ne $TenantId) {
         Write-Host "Current context tenant: $($context.Tenant.Id). Switching to: $TenantId" -ForegroundColor Yellow
@@ -533,6 +547,26 @@ foreach ($subscription in $subscriptions) {
         foreach ($nic in (Get-ArmList "/subscriptions/$($subscription.Id)/providers/Microsoft.Network/networkInterfaces?api-version=2024-05-01")) { $nicsById[$nic.id.ToLower()] = $nic }
         foreach ($pip in (Get-ArmList "/subscriptions/$($subscription.Id)/providers/Microsoft.Network/publicIPAddresses?api-version=2024-05-01")) { $publicIpsById[$pip.id.ToLower()] = $pip }
 
+        # SQL Server registrations (SQL IaaS extension), keyed by VM id
+        $sqlByVmId = @{}
+        foreach ($sql in (Get-ArmList "/subscriptions/$($subscription.Id)/providers/Microsoft.SqlVirtualMachine/sqlVirtualMachines?api-version=2022-02-01")) {
+            if ($sql.properties.virtualMachineResourceId) { $sqlByVmId[$sql.properties.virtualMachineResourceId.ToLower()] = $sql }
+        }
+
+        # Resource groups owned by a service (AKS, Databricks, managed apps): a deny assignment can block changes
+        $managedRgs = @{}
+        foreach ($rg in (Get-ArmList "/subscriptions/$($subscription.Id)/resourcegroups?api-version=2021-04-01")) {
+            if ($rg.managedBy) { $managedRgs[$rg.name.ToLower()] = $rg.managedBy }
+        }
+
+        # Assignments of the built-in "Allowed virtual machine size SKUs" policy, including ones inherited
+        # from management groups. Custom policies that restrict sizes are not detected.
+        $sizePolicies = @(Get-ArmList "/subscriptions/$($subscription.Id)/providers/Microsoft.Authorization/policyAssignments?api-version=2022-06-01" |
+            Where-Object { $_.properties.policyDefinitionId -like '*/policyDefinitions/cccc23c7-8427-4f53-ad12-b6a63eb452b3' })
+        foreach ($policy in $sizePolicies) {
+            Write-Warning "Allowed VM sizes policy '$($policy.properties.displayName ?? $policy.name)' at $($policy.properties.scope): $(@($policy.properties.parameters.listOfAllowedSKUs.value) -join ', ')"
+        }
+
         # Uniform scale set instances (including AKS node pools) are not returned by Get-AzVM
         try {
             $uniformScaleSets = @(Get-AzVmss -ErrorAction Stop | Where-Object { $_.OrchestrationMode -ne 'Flexible' })
@@ -624,6 +658,38 @@ foreach ($subscription in $subscriptions) {
                 EphemeralOsDisk           = if ($vm.StorageProfile.OsDisk.DiffDiskSettings.Option -eq 'Local') { $vm.StorageProfile.OsDisk.DiffDiskSettings.Placement ?? 'CacheDisk' } else { '' }
                 PrivateIPAllocation       = $null
                 PublicIPAllocation        = $null
+
+                # Placement and platform constraints on which sizes the VM can move to
+                ProximityPlacementGroup   = if ($vm.ProximityPlacementGroup.Id) { ($vm.ProximityPlacementGroup.Id -split '/')[-1] } else { '' }
+                DedicatedHost             = if ($vm.Host.Id) { (($vm.Host.Id -split '/')[-3, -1]) -join '/' } elseif ($vm.HostGroup.Id) { ($vm.HostGroup.Id -split '/')[-1] } else { '' }
+                Priority                  = if ($vm.Priority -and $vm.Priority -ne 'Regular') { $vm.Priority } else { '' }
+                CapacityReservationGroup  = if ($vm.CapacityReservation.CapacityReservationGroup.Id) { ($vm.CapacityReservation.CapacityReservationGroup.Id -split '/')[-1] } else { '' }
+                MarketplacePlan           = if ($vm.Plan.Publisher) { "$($vm.Plan.Publisher)/$($vm.Plan.Product)" } else { '' }
+                IPForwarding              = $null
+                AcceleratedNetworking     = $null
+                LoadBalanced              = $null
+                SharedDisk                = $null
+                SqlServer                 = ''
+                SqlAvailabilityGroup      = ''
+                ManagedResourceGroup      = if ($managedRgs[$vm.ResourceGroupName.ToLower()]) { ($managedRgs[$vm.ResourceGroupName.ToLower()] -split '/providers/')[-1] } else { '' }
+                AllowedSizesPolicy        = ''
+            }
+
+            # Allowed VM sizes policy in scope: assigned at a management group, or at this VM's subscription,
+            # resource group or the VM itself, and the VM not excluded
+            $vmIdLower = $vmResourceId.ToLower()
+            $inScope = $sizePolicies | Where-Object {
+                $scope = $_.properties.scope.ToLower()
+                ($scope -like '/providers/microsoft.management/managementgroups/*' -or $vmIdLower -eq $scope -or $vmIdLower.StartsWith("$scope/")) -and
+                -not (@($_.properties.notScopes) | Where-Object { $_ -and ($vmIdLower -eq $_.ToLower() -or $vmIdLower.StartsWith("$($_.ToLower())/")) })
+            }
+            if ($inScope) { $vmMetrics.AllowedSizesPolicy = 'Yes' }
+
+            # SQL Server edition (licensed per core) and Always On availability group, if registered
+            $sqlVm = $sqlByVmId[$vmIdLower]
+            if ($sqlVm) {
+                $vmMetrics.SqlServer = $sqlVm.properties.sqlImageSku ?? 'Registered'
+                if ($sqlVm.properties.sqlVirtualMachineGroupResourceId) { $vmMetrics.SqlAvailabilityGroup = ($sqlVm.properties.sqlVirtualMachineGroupResourceId -split '/')[-1] }
             }
 
             # CPU: peak from the per-interval maximum, average and P95 from the 5-minute averages
@@ -721,6 +787,8 @@ foreach ($subscription in $subscriptions) {
                 $vmMetrics.DiskSkus = (@($disks | ForEach-Object { $_.Sku.Name }) | Sort-Object -Unique) -join ';'
                 $vmMetrics.ProvisionedDiskIOPS = ($disks | Measure-Object -Property DiskIOPSReadWrite -Sum -ErrorAction SilentlyContinue).Sum
                 $vmMetrics.ProvisionedDiskMBps = ($disks | Measure-Object -Property DiskMBpsReadWrite -Sum -ErrorAction SilentlyContinue).Sum
+                # A disk attached to several VMs is typically a failover cluster's shared storage
+                $vmMetrics.SharedDisk = [bool]($disks | Where-Object { $_.MaxShares -gt 1 })
             }
             $osDiskId = $vm.StorageProfile.OsDisk.ManagedDisk.Id
             if ($osDiskId -and $disksById[$osDiskId.ToLower()]) {
@@ -743,7 +811,14 @@ foreach ($subscription in $subscriptions) {
 
             # IP allocation: a dynamic public IP is released when the VM is stopped, a dynamic
             # private IP when the NIC is replaced (e.g. a rebuild onto a new size)
-            $ipConfigs = @($vm.NetworkProfile.NetworkInterfaces | ForEach-Object { if ($_.Id) { $nicsById[$_.Id.ToLower()] } } | Where-Object { $_ } | ForEach-Object { $_.properties.ipConfigurations })
+            $nics = @($vm.NetworkProfile.NetworkInterfaces | ForEach-Object { if ($_.Id) { $nicsById[$_.Id.ToLower()] } } | Where-Object { $_ })
+            $ipConfigs = @($nics | ForEach-Object { $_.properties.ipConfigurations })
+            if ($nics.Count -gt 0) {
+                # IP forwarding marks a network virtual appliance; a backend pool, a VM that changes with its peers
+                $vmMetrics.IPForwarding = [bool]($nics | Where-Object { $_.properties.enableIPForwarding })
+                $vmMetrics.AcceleratedNetworking = [bool]($nics | Where-Object { $_.properties.enableAcceleratedNetworking })
+                $vmMetrics.LoadBalanced = [bool]($ipConfigs | Where-Object { $_.properties.loadBalancerBackendAddressPools -or $_.properties.applicationGatewayBackendAddressPools })
+            }
             if ($ipConfigs.Count -gt 0) {
                 $vmMetrics.PrivateIPAllocation = (@($ipConfigs | ForEach-Object { $_.properties.privateIPAllocationMethod }) | Sort-Object -Unique) -join ';'
                 $vmMetrics.PublicIPAllocation = (@($ipConfigs | ForEach-Object { if ($_.properties.publicIPAddress.id) { $publicIpsById[$_.properties.publicIPAddress.id.ToLower()].properties.publicIPAllocationMethod } } | Where-Object { $_ }) | Sort-Object -Unique) -join ';'

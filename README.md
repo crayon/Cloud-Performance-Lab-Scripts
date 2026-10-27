@@ -1,7 +1,7 @@
 # Cloud Performance Lab Scripts
 
 Read-only metric collectors for the **Cloud Performance Lab batch optimization**. Each script inventories the
-compute estate in one cloud, pulls 30 days of utilisation metrics from the native monitoring
+compute estate in one cloud, pulls 30 days (90 on Azure) of utilisation metrics from the native monitoring
 service, and writes a flat file (Excel or CSV) that is sent back for analysis.
 
 | Cloud | Folder | Script | Runtime | Output |
