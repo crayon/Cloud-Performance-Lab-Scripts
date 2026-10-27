@@ -255,6 +255,25 @@ function Limit-Value {
     return [math]::Round([math]::Min($Max, [math]::Max($Min, [double]$Value)), $Digits)
 }
 
+# Every item of an ARM list call, following nextLink. Invoke-AzRestMethod ships in Az.Accounts,
+# so network resources can be read without requiring Az.Network. Returns nothing on failure.
+function Get-ArmList {
+    param([string]$Path)
+    $items = @()
+    try {
+        $response = Invoke-AzRestMethod -Path $Path -Method GET -ErrorAction Stop
+        while ($response) {
+            if ($response.StatusCode -ne 200) { Write-Verbose "GET $Path returned $($response.StatusCode)"; break }
+            $page = $response.Content | ConvertFrom-Json
+            $items += @($page.value)
+            $response = if ($page.nextLink) { Invoke-AzRestMethod -Uri $page.nextLink -Method GET -ErrorAction Stop } else { $null }
+        }
+    } catch {
+        Write-Verbose "GET $Path failed: $($_.Exception.Message)"
+    }
+    return $items
+}
+
 # Per-location SKU capabilities (temp disk size), cached per subscription + location.
 $skuCache = @{}
 function Get-SkuCapability {
@@ -508,6 +527,12 @@ foreach ($subscription in $subscriptions) {
             Write-Verbose "Get-AzDisk failed in '$($subscription.Name)': $($_.Exception.Message)"
         }
 
+        # NICs and public IPs once per subscription, for the IP allocation columns
+        $nicsById = @{}
+        $publicIpsById = @{}
+        foreach ($nic in (Get-ArmList "/subscriptions/$($subscription.Id)/providers/Microsoft.Network/networkInterfaces?api-version=2024-05-01")) { $nicsById[$nic.id.ToLower()] = $nic }
+        foreach ($pip in (Get-ArmList "/subscriptions/$($subscription.Id)/providers/Microsoft.Network/publicIPAddresses?api-version=2024-05-01")) { $publicIpsById[$pip.id.ToLower()] = $pip }
+
         # Uniform scale set instances (including AKS node pools) are not returned by Get-AzVM
         try {
             $uniformScaleSets = @(Get-AzVmss -ErrorAction Stop | Where-Object { $_.OrchestrationMode -ne 'Flexible' })
@@ -595,6 +620,10 @@ foreach ($subscription in $subscriptions) {
                 ImageSku                  = $vm.StorageProfile.ImageReference.Sku
                 MaxTempDiskIOPS           = $null
                 MaxTempDiskMBps           = $null
+                # An ephemeral OS disk is wiped when the size changes; placement is CacheDisk, ResourceDisk or NvmeDisk
+                EphemeralOsDisk           = if ($vm.StorageProfile.OsDisk.DiffDiskSettings.Option -eq 'Local') { $vm.StorageProfile.OsDisk.DiffDiskSettings.Placement ?? 'CacheDisk' } else { '' }
+                PrivateIPAllocation       = $null
+                PublicIPAllocation        = $null
             }
 
             # CPU: peak from the per-interval maximum, average and P95 from the 5-minute averages
@@ -710,6 +739,14 @@ foreach ($subscription in $subscriptions) {
                 $tempBytes = Get-SeriesStat -Series @($temp["Temp Disk Read Bytes/sec"], $temp["Temp Disk Write Bytes/sec"]) -Stat Max
                 if ($null -ne $tempIops) { $vmMetrics.MaxTempDiskIOPS = Limit-Value $tempIops -Digits 0 }
                 if ($null -ne $tempBytes) { $vmMetrics.MaxTempDiskMBps = Limit-Value ($tempBytes / 1MB) }
+            }
+
+            # IP allocation: a dynamic public IP is released when the VM is stopped, a dynamic
+            # private IP when the NIC is replaced (e.g. a rebuild onto a new size)
+            $ipConfigs = @($vm.NetworkProfile.NetworkInterfaces | ForEach-Object { if ($_.Id) { $nicsById[$_.Id.ToLower()] } } | Where-Object { $_ } | ForEach-Object { $_.properties.ipConfigurations })
+            if ($ipConfigs.Count -gt 0) {
+                $vmMetrics.PrivateIPAllocation = (@($ipConfigs | ForEach-Object { $_.properties.privateIPAllocationMethod }) | Sort-Object -Unique) -join ';'
+                $vmMetrics.PublicIPAllocation = (@($ipConfigs | ForEach-Object { if ($_.properties.publicIPAddress.id) { $publicIpsById[$_.properties.publicIPAddress.id.ToLower()].properties.publicIPAllocationMethod } } | Where-Object { $_ }) | Sort-Object -Unique) -join ';'
             }
 
             $metricsResults.Add($vmMetrics) | Out-Null

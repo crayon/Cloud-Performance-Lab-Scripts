@@ -118,6 +118,8 @@ Every field below is written to the CSVs in plain text.
 | `LicenseType` | Azure Hybrid Benefit licence type, if set |
 | `ImagePublisher`, `ImageOffer`, `ImageSku` | Marketplace image the VM was created from (e.g. SQL Server images) |
 | `MaxTempDiskIOPS`, `MaxTempDiskMBps` | Peak read + write IOPS and MB/s on the temp disk, averaged over 5 minutes; empty when the size has none. Shows whether a move to a size without a temp disk is safe (a Windows pagefile on `D:` shows up here) |
+| `EphemeralOsDisk` | Placement of an ephemeral OS disk (`CacheDisk`, `ResourceDisk` or `NvmeDisk`); empty for a managed OS disk. Changing the size of such a VM wipes and reprovisions its OS disk |
+| `PrivateIPAllocation`, `PublicIPAllocation` | `Static` or `Dynamic` (both, `;`-separated, when the NICs differ); public is empty when the VM has no public IP. A dynamic public IP changes when the VM is stopped, a dynamic private IP when its NIC is replaced |
 
 Numbers are always written with a `.` decimal separator, whatever the machine's locale.
 
@@ -147,8 +149,10 @@ The signed-in account needs, at minimum:
 - `Microsoft.Insights/metrics/read`
 - `Microsoft.Compute/virtualMachines/read` (and `instanceView/read` for accurate power state)
 - `Microsoft.Compute/disks/read`, `Microsoft.Compute/virtualMachineScaleSets/read` and
-  `Microsoft.Compute/skus/read` for the disk, scale set and temp disk columns. All are part of
-  **Reader**; without them those columns stay empty and the run continues.
+  `Microsoft.Compute/skus/read` for the disk, scale set and temp disk columns, and
+  `Microsoft.Network/networkInterfaces/read` and `Microsoft.Network/publicIPAddresses/read` for
+  the IP allocation columns. All are part of **Reader**; without them those columns stay empty
+  and the run continues.
 
 If a subscription is missing access the script logs a warning and continues with the next one
 rather than aborting.
