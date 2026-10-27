@@ -34,16 +34,16 @@
 
 .EXAMPLE
     # macOS / Linux / Windows (PowerShell 7+):
-    pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -DaysBack 30 -IncludeAvailability
+    pwsh -File ./metrics_availability_assessment.ps1 -DaysBack 30 -IncludeAvailability
 
 .EXAMPLE
     # Headless server (no browser):
-    pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -UseDeviceAuthentication
+    pwsh -File ./metrics_availability_assessment.ps1 -UseDeviceAuthentication
 
 .NOTES
     Author: Crayon Group
-    Date: December 2025
-    Version: 2.3 (cross-platform CSV, hardened)
+    Date: October 2026
+    Version: 2.4 (move-readiness columns, locale-safe CSV)
     Runs on: Windows, macOS, Linux with PowerShell 7+
     Modules: Az.Accounts, Az.Compute, Az.Monitor (auto-installed for the current user if missing)
 #>
@@ -159,21 +159,26 @@ function Convert-BytesToGiB {
     return [math]::Round($Bytes / 1GB, 2)
 }
 
-function Get-MetricValue {
+# Returns a hashtable of metric name -> @{ timestamp = value } for the 5-minute series.
+# Several metrics share one call; if that call fails for a non-transient reason (e.g. one
+# metric is not published for this VM), each metric is retried on its own so one missing
+# metric never blanks the others.
+function Get-MetricSeries {
     param(
         [string]$ResourceId,
-        [string]$MetricName,
+        [string[]]$MetricNames,
         [datetime]$StartTime,
         [datetime]$EndTime,
         [string]$Aggregation = "Maximum"
     )
 
+    $result = @{}
     $maxAttempts = 4
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         try {
-            $metric = Get-AzMetric `
+            $metrics = Get-AzMetric `
                 -ResourceId $ResourceId `
-                -MetricName $MetricName `
+                -MetricName $MetricNames `
                 -StartTime $StartTime `
                 -EndTime $EndTime `
                 -TimeGrain 00:05:00 `
@@ -181,29 +186,93 @@ function Get-MetricValue {
                 -WarningAction SilentlyContinue `
                 -ErrorAction Stop
 
-            if ($metric.Data.Count -gt 0) {
-                switch ($Aggregation) {
-                    "Maximum"       { $vals = $metric.Data | Where-Object Maximum -ne $null | Select-Object -ExpandProperty Maximum; if ($vals) { return ($vals | Measure-Object -Maximum).Maximum } }
-                    "Minimum"       { $vals = $metric.Data | Where-Object Minimum -ne $null | Select-Object -ExpandProperty Minimum; if ($vals) { return ($vals | Measure-Object -Minimum).Minimum } }
-                    "Average"       { $vals = $metric.Data | Where-Object Average -ne $null | Select-Object -ExpandProperty Average; if ($vals) { return ($vals | Measure-Object -Average).Average } }
-                    "Total"         { $vals = $metric.Data | Where-Object Total   -ne $null | Select-Object -ExpandProperty Total;   if ($vals) { return ($vals | Measure-Object -Sum).Sum } }
+            foreach ($metric in @($metrics)) {
+                $series = @{}
+                foreach ($point in @($metric.Data)) {
+                    $value = $point.$Aggregation
+                    if ($null -ne $value) { $series[$point.TimeStamp] = [double]$value }
                 }
+                $result[$metric.Name.Value] = $series
             }
-            return $null
+            return $result
         } catch {
             $msg = $_.Exception.Message
             # Retry on throttling / transient errors with exponential backoff
             if ($msg -match '429|throttle|TooManyRequests|timeout|temporar' -and $attempt -lt $maxAttempts) {
                 $delay = [math]::Pow(2, $attempt)
-                Write-Verbose "Throttled on '$MetricName' (attempt $attempt). Sleeping $delay s."
+                Write-Verbose "Throttled on '$($MetricNames -join ', ')' (attempt $attempt). Sleeping $delay s."
                 Start-Sleep -Seconds $delay
                 continue
             }
-            Write-Verbose "Metric '$MetricName' not available: $msg"
-            return $null
+            if ($MetricNames.Count -gt 1) {
+                foreach ($name in $MetricNames) {
+                    $single = Get-MetricSeries -ResourceId $ResourceId -MetricNames @($name) -StartTime $StartTime -EndTime $EndTime -Aggregation $Aggregation
+                    foreach ($key in $single.Keys) { $result[$key] = $single[$key] }
+                }
+                return $result
+            }
+            Write-Verbose "Metric '$($MetricNames -join ', ')' not available: $msg"
+            return $result
         }
     }
-    return $null
+    return $result
+}
+
+# Summary statistics over one or more series. With several series the values are summed
+# per timestamp first (e.g. read + write), so peaks are measured at the same moment.
+function Get-SeriesStat {
+    param(
+        [hashtable[]]$Series,
+        [ValidateSet('Max', 'Min', 'Average', 'P95')]
+        [string]$Stat
+    )
+
+    $combined = @{}
+    foreach ($s in $Series) {
+        if (-not $s) { continue }
+        foreach ($key in $s.Keys) { $combined[$key] = ($combined[$key] ?? 0) + $s[$key] }
+    }
+    if ($combined.Count -eq 0) { return $null }
+
+    $values = [double[]]@($combined.Values)
+    switch ($Stat) {
+        'Max'     { return ($values | Measure-Object -Maximum).Maximum }
+        'Min'     { return ($values | Measure-Object -Minimum).Minimum }
+        'Average' { return ($values | Measure-Object -Average).Average }
+        'P95'     {
+            $sorted = $values | Sort-Object
+            $index = [math]::Ceiling(0.95 * $sorted.Count) - 1
+            return $sorted[[math]::Max(0, $index)]
+        }
+    }
+}
+
+# Clamp to a range and round. The Cloud Performance Lab upload rejects a row whose
+# percentages fall outside 0-100, and bursting disks can report more than 100%.
+function Limit-Value {
+    param($Value, [double]$Min = 0, [double]$Max = [double]::MaxValue, [int]$Digits = 2)
+    if ($null -eq $Value) { return $null }
+    return [math]::Round([math]::Min($Max, [math]::Max($Min, [double]$Value)), $Digits)
+}
+
+# Per-location SKU capabilities (temp disk size), cached per subscription + location.
+$skuCache = @{}
+function Get-SkuCapability {
+    param([string]$SubscriptionId, [string]$Location, [string]$VMSize, [string]$Capability)
+    $cacheKey = "$SubscriptionId/$Location"
+    if (-not $skuCache.ContainsKey($cacheKey)) {
+        $skuCache[$cacheKey] = @{}
+        try {
+            Get-AzComputeResourceSku -Location $Location -ErrorAction Stop |
+                Where-Object ResourceType -eq 'virtualMachines' |
+                ForEach-Object { $skuCache[$cacheKey][$_.Name] = $_ }
+        } catch {
+            Write-Verbose "Could not read VM SKUs for '$Location': $($_.Exception.Message)"
+        }
+    }
+    $sku = $skuCache[$cacheKey][$VMSize]
+    if (-not $sku) { return $null }
+    return ($sku.Capabilities | Where-Object Name -eq $Capability | Select-Object -First 1).Value
 }
 
 function Get-VMAvailability {
@@ -296,10 +365,14 @@ if ($UseDeviceAuthentication) { $connectArgs['UseDeviceAuthentication'] = $true 
 
 function Connect-AzureSafely {
     param([hashtable]$ConnectArgs)
+    # Az.Accounts 3+ prompts for a subscription after sign-in; the script walks every subscription itself.
+    # Process scope leaves the user's saved Az config untouched. Older Az.Accounts has no such setting.
+    try { Update-AzConfig -LoginExperienceV2 Off -Scope Process -ErrorAction Stop | Out-Null } catch {}
     try {
         Connect-AzAccount @ConnectArgs -ErrorAction Stop | Out-Null
     } catch {
-        Write-Error "Azure sign-in failed: $($_.Exception.Message)`nIf you don't have a browser available, re-run with -UseDeviceAuthentication."
+        $hint = if ($ConnectArgs.ContainsKey('UseDeviceAuthentication')) { '' } else { "`nIf you don't have a browser available, re-run with -UseDeviceAuthentication." }
+        Write-Error "Azure sign-in failed: $($_.Exception.Message)$hint"
         if ($transcriptPath) { try { Stop-Transcript | Out-Null } catch {} }
         exit 1
     }
@@ -398,6 +471,7 @@ if ($totalVMs -eq 0) {
 }
 
 # ----- Data Collection Stage -----
+$skippedScaleSets = 0
 foreach ($subscription in $subscriptions) {
     Write-Host "=====================================" -ForegroundColor Cyan
     Write-Host "Processing Subscription: $($subscription.Name)" -ForegroundColor Cyan
@@ -425,10 +499,31 @@ foreach ($subscription in $subscriptions) {
         }
 
         Write-Host "Found $(@($vms).Count) VM(s)." -ForegroundColor Green
+
+        # Managed disks once per subscription: SKU, provisioned performance, Hyper-V generation
+        $disksById = @{}
+        try {
+            Get-AzDisk -ErrorAction Stop | ForEach-Object { $disksById[$_.Id.ToLower()] = $_ }
+        } catch {
+            Write-Verbose "Get-AzDisk failed in '$($subscription.Name)': $($_.Exception.Message)"
+        }
+
+        # Uniform scale set instances (including AKS node pools) are not returned by Get-AzVM
+        try {
+            $uniformScaleSets = @(Get-AzVmss -ErrorAction Stop | Where-Object { $_.OrchestrationMode -ne 'Flexible' })
+            if ($uniformScaleSets.Count -gt 0) {
+                Write-Warning "$($uniformScaleSets.Count) Uniform VM scale set(s) in this subscription are not included (e.g. AKS node pools): $(($uniformScaleSets | Select-Object -ExpandProperty Name) -join ', ')"
+                $skippedScaleSets += $uniformScaleSets.Count
+            }
+        } catch {
+            Write-Verbose "Get-AzVmss failed in '$($subscription.Name)': $($_.Exception.Message)"
+        }
         Write-Host ""
 
         foreach ($vm in $vms) {
             $processedVMs++
+            # Autoscaling (e.g. AKS node pools) can add VMs after the initial count
+            if ($processedVMs -gt $totalVMs) { $totalVMs = $processedVMs }
             $percentComplete = if ($totalVMs -gt 0) { [math]::Round(($processedVMs / $totalVMs) * 100, 2) } else { 100 }
 
             $powerState = if ($vm.PowerState) { $vm.PowerState } else { "Unknown" }
@@ -437,7 +532,9 @@ foreach ($subscription in $subscriptions) {
 
             $vmResourceId = $vm.Id
 
-            # Build metrics row / column headers
+            # Build metrics row / column headers. The first 20 columns are what the Cloud
+            # Performance Lab upload reads; keep their names and order. Move-readiness
+            # columns are appended after them and are ignored by the upload.
             $vmMetrics = [PSCustomObject]@{
                 SubscriptionName        = $subscription.Name
                 SubscriptionId          = $subscription.Id
@@ -465,34 +562,59 @@ foreach ($subscription in $subscriptions) {
                 CollectionPeriodDays    = $DaysBack
                 CollectionStartDate     = $startTime.ToString("yyyy-MM-dd")
                 CollectionEndDate       = $endTime.ToString("yyyy-MM-dd")
+
+                # Utilisation detail
+                P95CPUPercent             = $null
+                MetricDays                = $null
+                MaxNetworkOutMbps         = $null
+                MaxDiskIOPS               = $null
+                MaxDiskMBps               = $null
+                MaxVMUncachedIOPSPercent  = $null
+                MaxVMUncachedMBpsPercent  = $null
+                MaxDataDiskIOPSPercent    = $null
+                MaxDataDiskMBpsPercent    = $null
+
+                # Move readiness
+                Zone                      = ($vm.Zones -join ';')
+                AvailabilitySet           = if ($vm.AvailabilitySetReference.Id) { ($vm.AvailabilitySetReference.Id -split '/')[-1] } else { '' }
+                ScaleSet                  = if ($vm.VirtualMachineScaleSet.Id) { ($vm.VirtualMachineScaleSet.Id -split '/')[-1] } else { '' }
+                # Set on VM-type node pools (aks-managed-poolName) and Node Auto Provisioning nodes (karpenter.sh_nodepool)
+                AksNodePool               = if ($vm.Tags) { @('aks-managed-poolName', 'karpenter.sh_nodepool') | ForEach-Object { $vm.Tags[$_] } | Where-Object { $_ } | Select-Object -First 1 } else { '' }
+                HyperVGeneration          = $null
+                SecurityType              = $vm.SecurityProfile.SecurityType
+                DiskControllerType        = $vm.StorageProfile.DiskControllerType
+                TempDiskGiB               = $null
+                DataDiskCount             = @($vm.StorageProfile.DataDisks).Count
+                DiskSkus                  = $null
+                ProvisionedDiskIOPS       = $null
+                ProvisionedDiskMBps       = $null
+                NicCount                  = @($vm.NetworkProfile.NetworkInterfaces).Count
+                LicenseType               = $vm.LicenseType
+                ImagePublisher            = $vm.StorageProfile.ImageReference.Publisher
+                ImageOffer                = $vm.StorageProfile.ImageReference.Offer
+                ImageSku                  = $vm.StorageProfile.ImageReference.Sku
             }
 
-            # CPU - max
-            $maxCPU = Get-MetricValue `
-                -ResourceId $vmResourceId `
-                -MetricName "Percentage CPU" `
-                -StartTime $startTime `
-                -EndTime $endTime `
-                -Aggregation "Maximum"
+            # CPU: peak from the per-interval maximum, average and P95 from the 5-minute averages
+            $cpuMax = Get-MetricSeries -ResourceId $vmResourceId -MetricNames @("Percentage CPU") -StartTime $startTime -EndTime $endTime -Aggregation "Maximum"
+            $cpuAvg = Get-MetricSeries -ResourceId $vmResourceId -MetricNames @("Percentage CPU") -StartTime $startTime -EndTime $endTime -Aggregation "Average"
 
-            if ($null -ne $maxCPU) { 
-                $vmMetrics.MaxCPUPercent = [math]::Round($maxCPU, 2) }
-            
-            # CPU - avg
-            $avgCPU = Get-MetricValue `
-                -ResourceId $vmResourceId `
-                -MetricName "Percentage CPU" `
-                -StartTime $startTime `
-                -EndTime $endTime `
-                -Aggregation "Average"
-
-            if ($null -ne $avgCPU) { 
-                $vmMetrics.AvgCPUPercent = [math]::Round($avgCPU, 3) }
+            $maxCPU = Limit-Value (Get-SeriesStat -Series $cpuMax["Percentage CPU"] -Stat Max) -Max 100
+            $avgCPU = Limit-Value (Get-SeriesStat -Series $cpuAvg["Percentage CPU"] -Stat Average) -Max 100
+            $p95CPU = Limit-Value (Get-SeriesStat -Series $cpuAvg["Percentage CPU"] -Stat P95) -Max 100
+            $vmMetrics.MaxCPUPercent = $maxCPU
+            # The upload rejects a row whose average is above its maximum, so never let rounding do that
+            $vmMetrics.AvgCPUPercent = if ($null -ne $avgCPU -and $null -ne $maxCPU) { [math]::Min($avgCPU, $maxCPU) } else { $avgCPU }
+            $vmMetrics.P95CPUPercent = if ($null -ne $p95CPU -and $null -ne $maxCPU) { [math]::Min($p95CPU, $maxCPU) } else { $p95CPU }
+            if ($cpuAvg["Percentage CPU"]) {
+                # Days actually covered by data; lower than CollectionPeriodDays for new or stopped VMs
+                $vmMetrics.MetricDays = [math]::Round($cpuAvg["Percentage CPU"].Count * 5 / 1440, 1)
+            }
 
             # Memory - Calculate USED memory (Total - Available)
             $vmSizeInfo = Get-AzVMSize `
                 -ResourceGroupName $vm.ResourceGroupName `
-                -VMName $vm.Name | 
+                -VMName $vm.Name |
                 Where-Object { $_.Name -eq $vm.HardwareProfile.VmSize }
 
             # Total CPU Cores
@@ -501,80 +623,82 @@ foreach ($subscription in $subscriptions) {
             }
 
             # Total Memory GiB
+            $TotalAllocatedMemoryGiB = $null
             if ($null -ne $vmSizeInfo) {
                 $TotalAllocatedMemoryGiB = $vmSizeInfo.MemoryInMB / 1024
                 $vmMetrics.TotalAllocatedMemoryGiB = [math]::Round($TotalAllocatedMemoryGiB, 2)
             }
-           
-            # Max Mem Used ( = Get MINIMUM available usage GiB)
-            $availableMemoryBytes = Get-MetricValue `
-                -ResourceId $vmResourceId `
-                -MetricName "Available Memory Bytes" `
-                -StartTime $startTime `
-                -EndTime $endTime `
-                -Aggregation "Minimum"
 
-            if ($null -ne $availableMemoryBytes -and $null -ne $TotalAllocatedMemoryGiB) {
-                $availableMemoryGiB = $availableMemoryBytes / 1GB
-                $usedMemoryGiB = $TotalAllocatedMemoryGiB - $availableMemoryGiB
-                $vmMetrics.MaxMemoryUsedGiB = [math]::Round($usedMemoryGiB, 3)
+            # Max used = total - minimum available; average used = total - average available.
+            # Clamped to 0..allocated, which the upload requires.
+            $memMin = Get-MetricSeries -ResourceId $vmResourceId -MetricNames @("Available Memory Bytes") -StartTime $startTime -EndTime $endTime -Aggregation "Minimum"
+            $memAvg = Get-MetricSeries -ResourceId $vmResourceId -MetricNames @("Available Memory Bytes") -StartTime $startTime -EndTime $endTime -Aggregation "Average"
+            $minAvailableBytes = Get-SeriesStat -Series $memMin["Available Memory Bytes"] -Stat Min
+            $avgAvailableBytes = Get-SeriesStat -Series $memAvg["Available Memory Bytes"] -Stat Average
+
+            if ($null -ne $TotalAllocatedMemoryGiB) {
+                $allocated = $vmMetrics.TotalAllocatedMemoryGiB
+                if ($null -ne $minAvailableBytes) {
+                    $vmMetrics.MaxMemoryUsedGiB = Limit-Value ($TotalAllocatedMemoryGiB - $minAvailableBytes / 1GB) -Max $allocated -Digits 3
+                }
+                if ($null -ne $avgAvailableBytes) {
+                    $avgUsed = Limit-Value ($TotalAllocatedMemoryGiB - $avgAvailableBytes / 1GB) -Max $allocated -Digits 3
+                    $vmMetrics.AvgMemoryUsedGiB = if ($null -ne $vmMetrics.MaxMemoryUsedGiB) { [math]::Min($avgUsed, $vmMetrics.MaxMemoryUsedGiB) } else { $avgUsed }
+                }
             }
 
-            # AVERAGE memory usage for typical use
-            $avgAvailableMemoryBytes = Get-MetricValue `
-                -ResourceId $vmResourceId `
-                -MetricName "Available Memory Bytes" `
-                -StartTime $startTime `
-                -EndTime $endTime `
-                -Aggregation "Average"
+            # Network: bytes per 5-minute interval -> Mbps averaged over that interval.
+            # In and out are summed per interval so both peaks come from the same moment.
+            $net = Get-MetricSeries -ResourceId $vmResourceId -MetricNames @("Network In Total", "Network Out Total") -StartTime $startTime -EndTime $endTime -Aggregation "Total"
+            $bytesToMbps = 8 / (300 * 1000000)
+            $netPeakBytes = Get-SeriesStat -Series @($net["Network In Total"], $net["Network Out Total"]) -Stat Max
+            $netOutPeakBytes = Get-SeriesStat -Series $net["Network Out Total"] -Stat Max
+            if ($null -ne $netPeakBytes) { $vmMetrics.MaxNetworkBandwidthMbps = Limit-Value ($netPeakBytes * $bytesToMbps) }
+            # Azure network limits per VM size apply to outbound traffic
+            if ($null -ne $netOutPeakBytes) { $vmMetrics.MaxNetworkOutMbps = Limit-Value ($netOutPeakBytes * $bytesToMbps) }
 
-            if ($null -ne $avgAvailableMemoryBytes -and $null -ne $TotalAllocatedMemoryGiB) {
-                $avgAvailableMemoryGiB = $avgAvailableMemoryBytes / 1GB
-                $avgUsedMemoryGiB = $TotalAllocatedMemoryGiB - $avgAvailableMemoryGiB
-                $vmMetrics.AvgMemoryUsedGiB = [math]::Round($avgUsedMemoryGiB, 3)
+            # Disk throughput across all disks (host metrics, no agent needed), as absolute
+            # values that can be compared with any target size's limits
+            $diskOps = Get-MetricSeries -ResourceId $vmResourceId -MetricNames @("Disk Read Operations/Sec", "Disk Write Operations/Sec") -StartTime $startTime -EndTime $endTime -Aggregation "Average"
+            $diskBytes = Get-MetricSeries -ResourceId $vmResourceId -MetricNames @("Disk Read Bytes", "Disk Write Bytes") -StartTime $startTime -EndTime $endTime -Aggregation "Total"
+            $iopsPeak = Get-SeriesStat -Series @($diskOps["Disk Read Operations/Sec"], $diskOps["Disk Write Operations/Sec"]) -Stat Max
+            $bytesPeak = Get-SeriesStat -Series @($diskBytes["Disk Read Bytes"], $diskBytes["Disk Write Bytes"]) -Stat Max
+            if ($null -ne $iopsPeak) { $vmMetrics.MaxDiskIOPS = Limit-Value $iopsPeak -Digits 0 }
+            if ($null -ne $bytesPeak) { $vmMetrics.MaxDiskMBps = Limit-Value ($bytesPeak / 300 / 1MB) }
+
+            # Consumed percentages: OS disk (upload columns), data disks, and the VM-level caps
+            $pctNames = @(
+                "OS Disk Bandwidth Consumed Percentage",
+                "OS Disk IOPS Consumed Percentage",
+                "Data Disk Bandwidth Consumed Percentage",
+                "Data Disk IOPS Consumed Percentage",
+                "VM Uncached Bandwidth Consumed Percentage",
+                "VM Uncached IOPS Consumed Percentage"
+            )
+            $pct = Get-MetricSeries -ResourceId $vmResourceId -MetricNames $pctNames -StartTime $startTime -EndTime $endTime -Aggregation "Maximum"
+            $vmMetrics.MaxDiskBandwidthPercent  = Limit-Value (Get-SeriesStat -Series $pct["OS Disk Bandwidth Consumed Percentage"] -Stat Max) -Max 100
+            $vmMetrics.MaxIOPSPercent           = Limit-Value (Get-SeriesStat -Series $pct["OS Disk IOPS Consumed Percentage"] -Stat Max) -Max 100
+            $vmMetrics.MaxDataDiskMBpsPercent   = Limit-Value (Get-SeriesStat -Series $pct["Data Disk Bandwidth Consumed Percentage"] -Stat Max) -Max 100
+            $vmMetrics.MaxDataDiskIOPSPercent   = Limit-Value (Get-SeriesStat -Series $pct["Data Disk IOPS Consumed Percentage"] -Stat Max) -Max 100
+            $vmMetrics.MaxVMUncachedMBpsPercent = Limit-Value (Get-SeriesStat -Series $pct["VM Uncached Bandwidth Consumed Percentage"] -Stat Max) -Max 100
+            $vmMetrics.MaxVMUncachedIOPSPercent = Limit-Value (Get-SeriesStat -Series $pct["VM Uncached IOPS Consumed Percentage"] -Stat Max) -Max 100
+
+            # Disks: SKUs, provisioned performance, Hyper-V generation (from the OS disk)
+            $diskRefs = @($vm.StorageProfile.OsDisk) + @($vm.StorageProfile.DataDisks)
+            $disks = @($diskRefs | ForEach-Object { if ($_.ManagedDisk.Id) { $disksById[$_.ManagedDisk.Id.ToLower()] } } | Where-Object { $_ })
+            if ($disks.Count -gt 0) {
+                $vmMetrics.DiskSkus = (@($disks | ForEach-Object { $_.Sku.Name }) | Sort-Object -Unique) -join ';'
+                $vmMetrics.ProvisionedDiskIOPS = ($disks | Measure-Object -Property DiskIOPSReadWrite -Sum -ErrorAction SilentlyContinue).Sum
+                $vmMetrics.ProvisionedDiskMBps = ($disks | Measure-Object -Property DiskMBpsReadWrite -Sum -ErrorAction SilentlyContinue).Sum
+            }
+            $osDiskId = $vm.StorageProfile.OsDisk.ManagedDisk.Id
+            if ($osDiskId -and $disksById[$osDiskId.ToLower()]) {
+                $vmMetrics.HyperVGeneration = $disksById[$osDiskId.ToLower()].HyperVGeneration
             }
 
-            # Network (Total over timegrain; rough Mbps estimation)
-            $networkInBytes  = Get-MetricValue `
-                -ResourceId $vmResourceId `
-                -MetricName "Network In Total" `
-                -StartTime $startTime `
-                -EndTime $endTime `
-                -Aggregation "Maximum"
-
-            $networkOutBytes = Get-MetricValue `
-                -ResourceId $vmResourceId `
-                -MetricName "Network Out Total" `
-                -StartTime $startTime `
-                -EndTime $endTime `
-                -Aggregation "Maximum"
-
-            if ($null -ne $networkInBytes -and $null -ne $networkOutBytes) {
-                #converting bytes to Mbps: (bytes x 8 bits) / (300 sec x 1,000,000)
-                $vmMetrics.MaxNetworkBandwidthMbps = [math]::Round((($networkInBytes + $networkOutBytes) * 8) / (300 * 1000000), 2)
-            }
-
-            # Disk % 
-            $diskBandwidth = Get-MetricValue `
-                -ResourceId $vmResourceId `
-                -MetricName "OS Disk Bandwidth Consumed Percentage" `
-                -StartTime $startTime `
-                -EndTime $endTime `
-                -Aggregation "Maximum"
-
-            if ($null -ne $diskBandwidth) { 
-                $vmMetrics.MaxDiskBandwidthPercent = [math]::Round($diskBandwidth, 2) }
-
-            # IOPS %
-            $iops = Get-MetricValue `
-                -ResourceId $vmResourceId `
-                -MetricName "OS Disk IOPS Consumed Percentage" `
-                -StartTime $startTime `
-                -EndTime $endTime `
-                -Aggregation "Maximum"
-
-            if ($null -ne $iops) { 
-                $vmMetrics.MaxIOPSPercent = [math]::Round($iops, 2) }
+            # Temp disk on the current size; Azure cannot resize directly between sizes with and without one
+            $tempDiskMB = Get-SkuCapability -SubscriptionId $subscription.Id -Location $vm.Location -VMSize $vm.HardwareProfile.VmSize -Capability 'MaxResourceVolumeMB'
+            if ($null -ne $tempDiskMB) { $vmMetrics.TempDiskGiB = [math]::Round([double]$tempDiskMB / 1024, 0) }
 
             $metricsResults.Add($vmMetrics) | Out-Null
 
@@ -625,12 +749,23 @@ $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $metricsCsvPath = Join-Path -Path $OutputPath -ChildPath "VM_Metrics_$timestamp.csv"
 $availCsvPath   = Join-Path -Path $OutputPath -ChildPath "VM_Availability_$timestamp.csv"
 
+# Write numbers with a '.' decimal separator whatever the machine's locale. On e.g. Nordic
+# or German locales they would otherwise come out as "97,34", which the upload rejects.
+$originalCulture = [cultureinfo]::CurrentCulture
+[cultureinfo]::CurrentCulture = [cultureinfo]::InvariantCulture
+
 try {
     if ($metricsResults.Count -gt 0) {
         $metricsResults `
             | Sort-Object SubscriptionName, ResourceGroup, VMName `
             | Export-Csv -Path $metricsCsvPath -NoTypeInformation -Encoding UTF8
         Write-Host "Metrics CSV: $metricsCsvPath  (rows: $($metricsResults.Count))" -ForegroundColor Green
+
+        # Cloud Performance Lab accepts files up to 5 MB and 10,000 rows
+        $csvSizeMB = (Get-Item -LiteralPath $metricsCsvPath).Length / 1MB
+        if ($csvSizeMB -gt 5 -or $metricsResults.Count -gt 10000) {
+            Write-Warning ("The metrics CSV is {0:N1} MB with {1} rows, above the Cloud Performance Lab upload limit (5 MB, 10,000 rows). Split it into smaller files, e.g. by subscription, before uploading." -f $csvSizeMB, $metricsResults.Count)
+        }
     } else {
         Write-Warning "No metrics data to export."
     }
@@ -649,10 +784,15 @@ try {
     Write-Host "Export Complete!" -ForegroundColor Green
     Write-Host "=====================================" -ForegroundColor Green
     Write-Host "Total VMs processed: $processedVMs" -ForegroundColor Yellow
+    if ($skippedScaleSets -gt 0) {
+        Write-Host "Uniform scale sets not included: $skippedScaleSets (see warnings above)" -ForegroundColor Yellow
+    }
     Write-Host ""
 
 } catch {
     Write-Error "Failed to export CSV: $($_.Exception.Message)"
+} finally {
+    [cultureinfo]::CurrentCulture = $originalCulture
 }
 
 Write-Host "Script execution completed." -ForegroundColor Cyan

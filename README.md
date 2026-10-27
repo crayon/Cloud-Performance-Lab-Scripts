@@ -21,7 +21,7 @@ Verify with `pwsh --version` (should report 7.x or newer).
 ## Run it
 
 ```powershell
-pwsh -File ./amd_metrics_availability_assessment_1.3.ps1
+pwsh -File ./metrics_availability_assessment.ps1
 ```
 
 On first run the script installs `Az.Accounts`, `Az.Compute`, and `Az.Monitor` to your user
@@ -34,17 +34,17 @@ profile. This downloads roughly 600 MB and can take several minutes — that's n
 > with `-SkipModuleCheck` so the script performs no installation:
 > ```powershell
 > Install-Module Az.Accounts, Az.Compute, Az.Monitor -Scope CurrentUser
-> pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -SkipModuleCheck
+> pwsh -File ./metrics_availability_assessment.ps1 -SkipModuleCheck
 > ```
 
 Common variants:
 
 ```powershell
-pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -DaysBack 14 -IncludeAvailability
-pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -TenantId <tenant-guid>
-pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -UseDeviceAuthentication   # SSH / headless
-pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -VMNames vm-prd-01,vm-prd-02
-pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -OutputPath ~/assessments
+pwsh -File ./metrics_availability_assessment.ps1 -DaysBack 14 -IncludeAvailability
+pwsh -File ./metrics_availability_assessment.ps1 -TenantId <tenant-guid>
+pwsh -File ./metrics_availability_assessment.ps1 -UseDeviceAuthentication   # SSH / headless
+pwsh -File ./metrics_availability_assessment.ps1 -VMNames vm-prd-01,vm-prd-02
+pwsh -File ./metrics_availability_assessment.ps1 -OutputPath ~/assessments
 ```
 
 ## Parameters
@@ -98,10 +98,36 @@ Every field below is written to the CSVs in plain text.
 | `TotalCPUCores` | vCPU count for the SKU |
 | `MaxMemoryUsedGiB`, `AvgMemoryUsedGiB` | Peak and average memory used (requires Azure Monitor Agent) |
 | `TotalAllocatedMemoryGiB` | Memory allocated to the SKU |
-| `MaxNetworkBandwidthMbps` | Peak combined in/out network throughput (estimated) |
-| `MaxDiskBandwidthPercent` | Peak OS disk bandwidth consumed as a percentage of the cap |
-| `MaxIOPSPercent` | Peak OS disk IOPS consumed as a percentage of the cap |
+| `MaxNetworkBandwidthMbps` | Peak combined in + out network throughput, averaged over 5 minutes |
+| `MaxDiskBandwidthPercent` | Peak OS disk bandwidth consumed as a percentage of the cap (capped at 100) |
+| `MaxIOPSPercent` | Peak OS disk IOPS consumed as a percentage of the cap (capped at 100) |
 | `CollectionPeriodDays`, `CollectionStartDate`, `CollectionEndDate` | The look-back window used for the run |
+| `P95CPUPercent` | 95th percentile of 5-minute CPU averages; less sensitive to one-off spikes than the peak |
+| `MetricDays` | Days actually covered by CPU data; lower than `CollectionPeriodDays` for VMs created or stopped during the window |
+| `MaxNetworkOutMbps` | Peak outbound throughput, averaged over 5 minutes (Azure network limits per size apply to outbound) |
+| `MaxDiskIOPS`, `MaxDiskMBps` | Peak read + write IOPS and MB/s across all disks, averaged over 5 minutes |
+| `MaxVMUncachedIOPSPercent`, `MaxVMUncachedMBpsPercent` | Peak use of the VM size's uncached disk IOPS and throughput caps |
+| `MaxDataDiskIOPSPercent`, `MaxDataDiskMBpsPercent` | Peak data disk IOPS and bandwidth consumed as a percentage of the disk caps |
+| `Zone`, `AvailabilitySet`, `ScaleSet` | Availability zone, availability set and Flexible scale set the VM belongs to |
+| `AksNodePool` | AKS node pool the VM belongs to, if it is an AKS node (see below) |
+| `HyperVGeneration`, `SecurityType`, `DiskControllerType` | VM generation (from the OS disk), Trusted Launch / confidential, SCSI or NVMe |
+| `TempDiskGiB` | Temp (resource) disk size of the current SKU; 0 means none |
+| `DataDiskCount`, `DiskSkus` | Number of data disks and the storage SKUs in use |
+| `ProvisionedDiskIOPS`, `ProvisionedDiskMBps` | Sum of the provisioned performance of the VM's managed disks |
+| `NicCount` | Number of network interfaces |
+| `LicenseType` | Azure Hybrid Benefit licence type, if set |
+| `ImagePublisher`, `ImageOffer`, `ImageSku` | Marketplace image the VM was created from (e.g. SQL Server images) |
+
+Numbers are always written with a `.` decimal separator, whatever the machine's locale.
+
+VMs in **Uniform** scale sets, which includes AKS node pools backed by scale sets (the default),
+are not returned by the VM API and are not in the CSV. The script prints a warning listing those scale sets.
+
+AKS nodes that are standalone VMs, from node pools of type `VirtualMachines` and from Node Auto
+Provisioning (Karpenter), **are** in the CSV, with the pool name in `AksNodePool`. Don't resize
+these VMs one by one: AKS manages them and replaces nodes often, so they may have only hours of
+data (`MetricDays`). Right-size them by changing the node pool's VM size or the Node Auto
+Provisioning SKU requirements instead.
 
 **`VM_Availability_*.csv`** (only with `-IncludeAvailability`)
 
@@ -119,6 +145,9 @@ The signed-in account needs, at minimum:
 - **Reader** on each in-scope subscription
 - `Microsoft.Insights/metrics/read`
 - `Microsoft.Compute/virtualMachines/read` (and `instanceView/read` for accurate power state)
+- `Microsoft.Compute/disks/read`, `Microsoft.Compute/virtualMachineScaleSets/read` and
+  `Microsoft.Compute/skus/read` for the disk, scale set and temp disk columns. All are part of
+  **Reader**; without them those columns stay empty and the run continues.
 
 If a subscription is missing access the script logs a warning and continues with the next one
 rather than aborting.
@@ -151,7 +180,7 @@ Roughly 2–5 seconds per VM, plus the one-time module install on first run. A 2
 Set the context first, then pass `-SkipModuleCheck` if modules are already loaded:
 ```powershell
 Set-AzContext -SubscriptionId <sub-guid>
-pwsh -File ./amd_metrics_availability_assessment_1.3.ps1 -TenantId <tenant-guid>
+pwsh -File ./metrics_availability_assessment.ps1 -TenantId <tenant-guid>
 ```
 The tenant filter combined with the active context effectively scopes the run.
 
@@ -190,6 +219,7 @@ Send the two CSVs and the matching `.log` file from `-OutputPath`. The log is a 
   ```
 - **Empty memory / disk metrics for some VMs** — Azure requires the Azure Monitor agent for guest-level memory and disk metrics. Host-level CPU and network always populate.
 - **`-DaysBack` warning** — Azure caps VM metric retention at 30 days; older days will be empty.
+- **Upload size warning** — Cloud Performance Lab accepts files up to 5 MB and 10,000 rows. For larger tenants, run the script per subscription (see Q&A) and upload the files together.
 - **Script feels stuck on first run** — it's downloading the Az modules (~600 MB). Subsequent runs are fast.
 
 ## License
