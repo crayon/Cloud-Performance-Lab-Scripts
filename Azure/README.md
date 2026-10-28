@@ -52,6 +52,7 @@ pwsh -File ./metrics_availability_assessment.ps1 -OutputPath ~/assessments
 | Parameter | Default | Description |
 |---|---|---|
 | `-DaysBack` | `90` | Look-back window in days (1–90). The default catches month- and quarter-end peaks. Azure Monitor keeps platform metrics for 93 days and returns at most 31 days per query, so longer windows are fetched in 30-day chunks; a shorter window runs faster. |
+| `-ThrottleLimit` | `8` | Number of VMs whose metrics are fetched at the same time (1–32). Use `1` to fetch one VM at a time if Azure Monitor throttles the run. |
 | `-OutputPath` | current dir | Where the CSVs and run log are written. Created if it doesn't exist. |
 | `-IncludeAvailability` | off | Also collect VM availability data. |
 | `-TenantId` | current context | Restrict to a specific tenant. |
@@ -174,7 +175,9 @@ rather than aborting.
 
 - **PowerShell 7 enforced** with `#Requires -Version 7.0`.
 - **Az modules auto-installed** on first run; a clear remediation hint is shown if install is blocked.
-- **Throttling-aware metric calls** retry up to 4 times with exponential backoff on HTTP 429 / timeouts.
+- **Fast metric collection** — all of a VM's metrics come from a few Azure Monitor REST requests per 30-day chunk, for 8 VMs at a time (`-ThrottleLimit`). A tenant of 69 VMs takes about 8 minutes for 90 days.
+- **Throttling-aware metric calls** retry up to 4 times with exponential backoff on HTTP 429, server errors and timeouts (2 minutes per request).
+- **Repeatable peaks** — the window starts on a 5-minute boundary, so peaks match the Azure portal and don't depend on when the script runs.
 - **Graceful per-subscription failures** — a tenant-wide run keeps going if one subscription denies access.
 - **`Get-AzVM -Status` fallback** — if `instanceView/read` is missing, the script falls back to `Get-AzVM` and marks PowerState as `Unknown`.
 - **Sign-in failures abort early** with a hint to retry with `-UseDeviceAuthentication`.
@@ -189,7 +192,7 @@ No. The script runs locally, calls Azure Resource Manager with your credentials,
 Whatever you sign in with at the `Connect-AzAccount` prompt — interactive browser by default, device code with `-UseDeviceAuthentication`. No service principal or secret is required.
 
 **Will it change anything in my Azure environment?**
-No. All calls are read-only (`Get-AzSubscription`, `Get-AzVM`, `Get-AzMetric`, `Get-AzActivityLog`). The only writes are to your local output folder.
+No. All calls are read-only: Az cmdlets such as `Get-AzSubscription`, `Get-AzVM` and `Get-AzActivityLog`, and `GET` requests to the Azure Resource Manager and Azure Monitor REST APIs. The only writes are to your local output folder.
 
 **How long will it take?**
 Roughly 2–5 seconds per VM, plus the one-time module install on first run. A 200-VM tenant typically completes in 10–20 minutes.
