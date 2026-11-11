@@ -42,6 +42,7 @@ Common variants:
 ```powershell
 pwsh -File ./metrics_availability_assessment.ps1 -DaysBack 14 -IncludeAvailability
 pwsh -File ./metrics_availability_assessment.ps1 -TenantId <tenant-guid>
+pwsh -File ./metrics_availability_assessment.ps1 -SubscriptionIds <sub-guid-1>,<sub-guid-2>
 pwsh -File ./metrics_availability_assessment.ps1 -UseDeviceAuthentication   # SSH / headless
 pwsh -File ./metrics_availability_assessment.ps1 -VMNames vm-prd-01,vm-prd-02
 pwsh -File ./metrics_availability_assessment.ps1 -OutputPath ~/assessments
@@ -51,11 +52,12 @@ pwsh -File ./metrics_availability_assessment.ps1 -OutputPath ~/assessments
 
 | Parameter | Default | Description |
 |---|---|---|
-| `-DaysBack` | `90` | Look-back window in days (1–90). The default catches month- and quarter-end peaks. Azure Monitor keeps platform metrics for 93 days and returns at most 31 days per query, so longer windows are fetched in 30-day chunks; a shorter window runs faster. |
+| `-DaysBack` | `90` | Look-back window in days (1–90). The default catches month- and quarter-end peaks. Azure Monitor keeps platform metrics for 93 days and returns at most 31 days per query, so longer windows are fetched in 30-day chunks; a shorter window runs faster (30 days takes about a third of the time). |
 | `-ThrottleLimit` | `8` | Number of VMs whose metrics are fetched at the same time (1–32). Use `1` to fetch one VM at a time if Azure Monitor throttles the run. |
 | `-OutputPath` | current dir | Where the CSVs and run log are written. Created if it doesn't exist. |
 | `-IncludeAvailability` | off | Also collect VM availability data. |
 | `-TenantId` | current context | Restrict to a specific tenant. |
+| `-SubscriptionIds` | all | Comma-separated subscription IDs to include. Use it to split a large tenant into several shorter runs. |
 | `-VMNames` | all | Comma-separated VM names to include. |
 | `-UseDeviceAuthentication` | off | Device-code login for headless / SSH sessions. |
 | `-SkipModuleCheck` | off | Skip auto-install of Az modules (faster on warm machines, or if a corporate policy blocks `Install-Module`). |
@@ -67,6 +69,13 @@ Three timestamped files are written to `-OutputPath`:
 - `VM_Metrics_yyyyMMdd_HHmmss.csv` — one row per VM with sizing, CPU, memory, network, disk, IOPS.
 - `VM_Availability_yyyyMMdd_HHmmss.csv` — only with `-IncludeAvailability`.
 - `VM_Assessment_yyyyMMdd_HHmmss.log` — full transcript of the run. Send this if you need help diagnosing a failure. **Review and sanitise this before sharing** — see the note below.
+
+While the run is in progress, rows are also appended to `VM_Metrics_yyyyMMdd_HHmmss.partial.csv`
+(and `VM_Availability_…partial.csv`) as each batch of 25 VMs finishes. A complete run deletes them
+once the final files are written. If a run stops part-way (laptop asleep, VPN dropped, window
+closed), the `.partial.csv` holds every VM collected so far: send it with the log. A run that ends
+with **Export INCOMPLETE** (the sign-in lapsed, or a subscription failed part-way) also keeps them,
+and names the subscriptions to re-run with `-SubscriptionIds`.
 
 > **Transcript may contain sensitive details.** The `.log` is a verbatim transcript of the
 > console session, so beyond the data in the CSVs it can capture the signed-in account
@@ -132,6 +141,7 @@ Every field below is written to the CSVs in plain text.
 | `SqlServer`, `SqlAvailabilityGroup` | SQL Server edition and Always On availability group, for VMs registered with the SQL IaaS extension |
 | `ManagedResourceGroup` | Service that owns the VM's resource group (e.g. `Microsoft.Databricks/workspaces/...`); its deny assignment can block a resize |
 | `AllowedSizesPolicy` | `Yes` when the built-in "Allowed virtual machine size SKUs" policy applies; the allowed sizes are printed as a warning. Custom policies are not detected |
+| `MetricGaps` | Empty when every metric request succeeded. Otherwise the metrics whose data is incomplete because Azure Monitor kept throttling or failing after retries, as `<metric>:<failed chunks>/<chunks>` separated by `;` (e.g. `Percentage CPU:1/3`), or `All metrics:<n>/<chunks>`. `All metrics:fetch failed` means no metrics could be fetched for the VM at all (e.g. its access token was rejected twice). Each chunk is up to 30 days. The VM's values come from the data that did arrive, so a peak may be understated |
 
 Numbers are always written with a `.` decimal separator, whatever the machine's locale.
 
@@ -176,7 +186,10 @@ rather than aborting.
 - **PowerShell 7 enforced** with `#Requires -Version 7.0`.
 - **Az modules auto-installed** on first run; a clear remediation hint is shown if install is blocked.
 - **Fast metric collection** — all of a VM's metrics come from a few Azure Monitor REST requests per 30-day chunk, for 8 VMs at a time (`-ThrottleLimit`). A tenant of 69 VMs takes about 8 minutes for 90 days.
-- **Throttling-aware metric calls** retry up to 4 times with exponential backoff on HTTP 429, server errors and timeouts (2 minutes per request).
+- **Throttling-aware metric calls** make up to 6 attempts on HTTP 429, server errors, timeouts (2 minutes per request) and cut-off replies, waiting as long as Azure's `Retry-After` asks, at most 5 minutes per wait. Each VM may spend at most 10 minutes waiting in total; after that, or once one of its requests has failed every attempt, its remaining requests get a single attempt, so a struggling Azure Monitor can't hold the run for hours. A request that still fails leaves only that 30-day chunk empty for those metrics, the run continues, and the VM's `MetricGaps` column says so. A metric is dropped only when Azure says the VM doesn't publish it; any other rejected request is recorded as a gap.
+- **Fresh access tokens** — a new token is taken for every batch of 25 VMs, and a VM whose token expired or was revoked mid-batch is retried once with a new one. If no new token can be had (the sign-in lapsed), the run stops, keeps what it has and says so.
+- **Flat memory use** — each VM's 5-minute series are reduced to the row's values as soon as the VM is done, so memory doesn't grow with the size of the tenant.
+- **Partial results saved as it goes** — see `.partial.csv` under [Output](#output).
 - **Repeatable peaks** — the window starts on a 5-minute boundary, so peaks match the Azure portal and don't depend on when the script runs.
 - **Graceful per-subscription failures** — a tenant-wide run keeps going if one subscription denies access.
 - **`Get-AzVM -Status` fallback** — if `instanceView/read` is missing, the script falls back to `Get-AzVM` and marks PowerState as `Unknown`.
@@ -195,15 +208,13 @@ Whatever you sign in with at the `Connect-AzAccount` prompt — interactive brow
 No. All calls are read-only: Az cmdlets such as `Get-AzSubscription`, `Get-AzVM` and `Get-AzActivityLog`, and `GET` requests to the Azure Resource Manager and Azure Monitor REST APIs. The only writes are to your local output folder.
 
 **How long will it take?**
-Roughly 2–5 seconds per VM, plus the one-time module install on first run. A 200-VM tenant typically completes in 10–20 minutes.
+Roughly 7 seconds per VM for the default 90 days, plus the one-time module install on first run: a 200-VM tenant takes about 25 minutes, 1,000 VMs about 2 hours, longer if Azure Monitor throttles. `-DaysBack 30` takes about a third of that.
 
 **Can I run it against just one subscription?**
-Set the context first, then pass `-SkipModuleCheck` if modules are already loaded:
+Yes, pass its ID; several IDs, comma-separated, split a large tenant into shorter runs:
 ```powershell
-Set-AzContext -SubscriptionId <sub-guid>
-pwsh -File ./metrics_availability_assessment.ps1 -TenantId <tenant-guid>
+pwsh -File ./metrics_availability_assessment.ps1 -SubscriptionIds <sub-guid>
 ```
-The tenant filter combined with the active context effectively scopes the run.
 
 **Why does `MaxMemoryUsedGiB` say nothing for some VMs?**
 That column relies on the `Available Memory Bytes` guest metric, which only emits when the **Azure Monitor Agent** (or legacy diagnostics extension) is installed on the VM. CPU, network, and host-disk metrics don't need an agent.
@@ -239,8 +250,13 @@ Send the two CSVs and the matching `.log` file from `-OutputPath`. The log is a 
   Install-Module Az.Accounts, Az.Compute, Az.Monitor -Scope CurrentUser
   ```
 - **Empty memory / disk metrics for some VMs** — Azure requires the Azure Monitor agent for guest-level memory and disk metrics. Host-level CPU and network always populate.
-- **Upload size warning** — Cloud Performance Lab accepts files up to 5 MB and 10,000 rows. For larger tenants, run the script per subscription (see Q&A) and upload the files together.
+- **Upload size warning** — Cloud Performance Lab accepts files up to 5 MB and 10,000 rows. For larger tenants, run the script per group of subscriptions with `-SubscriptionIds` and upload the files together.
 - **Script feels stuck on first run** — it's downloading the Az modules (~600 MB). Subsequent runs are fast.
+- **`… is not digitally signed` or `running scripts is disabled`** — Windows marks files downloaded from GitHub as coming from the internet, and the execution policy blocks them. Unblock the file once (`Unblock-File ./metrics_availability_assessment.ps1`), or run it with `pwsh -ExecutionPolicy Bypass -File ./metrics_availability_assessment.ps1` if your policy allows that.
+- **`… running in ConstrainedLanguage mode`** — an AppLocker or WDAC policy restricts PowerShell on this machine, and the script can't run under it. Run it from a machine or account the policy doesn't apply to, e.g. an admin workstation or a VM in the tenant.
+- **`Failed to load Az.Accounts` (or Az.Compute / Az.Monitor)** — usually an older Az version is already loaded or installed side by side. Close every PowerShell window, run `Update-Module Az.Accounts, Az.Compute, Az.Monitor -Scope CurrentUser` in a new `pwsh`, and run the script again.
+- **Sign-in fails or finds no subscriptions** — Conditional Access can block device-code sign-in or sign-ins from unmanaged machines. Sign in from a compliant machine with a browser, or pass `-TenantId` if the account is a guest in several tenants.
+- **`MetricGaps` filled in for many VMs** — Azure Monitor kept throttling. Re-run later, or with `-ThrottleLimit 1`, optionally per subscription with `-SubscriptionIds`.
 
 ## License
 
