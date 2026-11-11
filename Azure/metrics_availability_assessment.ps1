@@ -328,6 +328,10 @@ function Get-MetricData {
                     $half = [math]::Ceiling($batch.Count / 2)
                     $queue.Enqueue($batch[0..($half - 1)])
                     $queue.Enqueue($batch[$half..($batch.Count - 1)])
+                } elseif ($response.StatusCode -in 403, 404) {
+                    # No access to this VM's metrics, or the VM is gone: asking metric by metric gets the same answer
+                    & $addGap $batch
+                    Write-Verbose "Metrics request refused for the VM ($($response.StatusCode)): $message"
                 } elseif ($batch.Count -gt 1) {
                     # Find which metric the request rejects by asking for each one alone
                     foreach ($name in $batch) { $queue.Enqueue(@($name)) }
