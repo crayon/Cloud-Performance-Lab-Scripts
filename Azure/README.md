@@ -183,7 +183,7 @@ rather than aborting.
 
 ## Resilience built in
 
-- **PowerShell 7 enforced** with `#Requires -Version 7.0`.
+- **PowerShell 7 enforced** with `#Requires -Version 7.0`. PowerShell 7.4 or later is recommended: only from 7.4 can a metrics download that stalls part-way (VPN drop, laptop asleep) be timed out and retried. On 7.0–7.3 the script warns at start-up, and such a stall hangs the run.
 - **Az modules auto-installed** on first run; a clear remediation hint is shown if install is blocked.
 - **Fast metric collection** — all of a VM's metrics come from a few Azure Monitor REST requests per 30-day chunk, for 8 VMs at a time (`-ThrottleLimit`). A tenant of 69 VMs takes about 8 minutes for 90 days.
 - **Throttling-aware metric calls** make up to 6 attempts on HTTP 429, server errors, timeouts (2 minutes per request) and cut-off replies, waiting as long as Azure's `Retry-After` asks, at most 5 minutes per wait. Each VM may spend at most 10 minutes waiting in total; after that, or once one of its requests has failed every attempt, its remaining requests get a single attempt, so a struggling Azure Monitor can't hold the run for hours. A request that still fails leaves only that 30-day chunk empty for those metrics, the run continues, and the VM's `MetricGaps` column says so. A metric is dropped only when Azure says the VM doesn't publish it; any other rejected request is recorded as a gap.
@@ -256,6 +256,7 @@ Send the two CSVs and the matching `.log` file from `-OutputPath`. The log is a 
 - **`… running in ConstrainedLanguage mode`** — an AppLocker or WDAC policy restricts PowerShell on this machine, and the script can't run under it. Run it from a machine or account the policy doesn't apply to, e.g. an admin workstation or a VM in the tenant.
 - **`Failed to load Az.Accounts` (or Az.Compute / Az.Monitor)** — usually an older Az version is already loaded or installed side by side. Close every PowerShell window, run `Update-Module Az.Accounts, Az.Compute, Az.Monitor -Scope CurrentUser` in a new `pwsh`, and run the script again.
 - **Sign-in fails or finds no subscriptions** — Conditional Access can block device-code sign-in or sign-ins from unmanaged machines. Sign in from a compliant machine with a browser, or pass `-TenantId` if the account is a guest in several tenants.
+- **Run stops printing progress part-way through a batch, on PowerShell 7.0–7.3** — a metrics download stalled and those versions cannot time it out. Stop the run (the `.partial.csv` has every finished batch), update to PowerShell 7.4 or later and run again.
 - **`MetricGaps` filled in for many VMs** — Azure Monitor kept throttling. Re-run later, or with `-ThrottleLimit 1`, optionally per subscription with `-SubscriptionIds`.
 
 ## License
