@@ -732,6 +732,8 @@ Write-Host ""
 # Count VMs for progress (per-subscription tolerant of access errors)
 $totalVMs = 0
 $processedVMs = 0
+# The listing made for the count, per subscription id, so the collection stage doesn't list again
+$listedVMs = @{}
 
 foreach ($subscription in $subscriptions) {
     try {
@@ -743,6 +745,7 @@ foreach ($subscription in $subscriptions) {
 
     try {
         $vms = Get-AzVM -Status -ErrorAction Stop
+        $listedVMs[$subscription.Id] = @($vms)
     } catch {
         Write-Verbose "Get-AzVM -Status failed in '$($subscription.Name)' ($($_.Exception.Message)). Falling back to Get-AzVM without status."
         try { $vms = Get-AzVM -ErrorAction Stop } catch { $vms = @() }
@@ -786,11 +789,16 @@ foreach ($subscription in $subscriptions) {
     try {
         Set-AzContext -SubscriptionId $subscription.Id -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null
 
-        try {
-            $vms = Get-AzVM -Status -ErrorAction Stop
-        } catch {
-            Write-Warning "Get-AzVM -Status failed: $($_.Exception.Message). Retrying without -Status (PowerState will be unknown)."
-            $vms = Get-AzVM -ErrorAction Stop
+        if ($listedVMs.ContainsKey($subscription.Id)) {
+            $vms = $listedVMs[$subscription.Id]
+            $listedVMs.Remove($subscription.Id)
+        } else {
+            try {
+                $vms = Get-AzVM -Status -ErrorAction Stop
+            } catch {
+                Write-Warning "Get-AzVM -Status failed: $($_.Exception.Message). Retrying without -Status (PowerState will be unknown)."
+                $vms = Get-AzVM -ErrorAction Stop
+            }
         }
 
         if ($VMNames) {
