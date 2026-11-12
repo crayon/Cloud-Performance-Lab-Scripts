@@ -35,6 +35,11 @@
 .PARAMETER VMNames
     Optional array of VM names to filter. When not specified, all VMs in scope are processed.
 
+.PARAMETER ResumeFrom
+    Path to the VM_Metrics_*.partial.csv (or VM_Metrics_*.csv) of an earlier run by this version of
+    the script. VMs with a complete row in it are not fetched again and their rows are carried into
+    this run's output; VMs whose row has MetricGaps, and VMs not in the file, are fetched.
+
 .PARAMETER UseDeviceAuthentication
     Use device-code login instead of opening a browser.
     Recommended for headless Linux, SSH sessions, or any environment without a desktop browser.
@@ -85,6 +90,9 @@ param(
 
     [Parameter(Mandatory = $false)]
     [string[]]$VMNames,
+
+    [Parameter(Mandatory = $false)]
+    [string]$ResumeFrom,
 
     [Parameter(Mandatory = $false)]
     [switch]$UseDeviceAuthentication,
@@ -595,6 +603,52 @@ function Add-PartialRows {
     }
 }
 
+# ----- Resume from an earlier run -----
+# Complete rows of the earlier run are kept as they are and those VMs are skipped below. They are
+# also written to this run's .partial.csv, so that file can in turn be resumed from.
+$resumedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+if ($ResumeFrom) {
+    try {
+        $resumePath = (Resolve-Path -LiteralPath $ResumeFrom -ErrorAction Stop).Path
+        $resumeRows = @(Import-Csv -LiteralPath $resumePath -ErrorAction Stop)
+        $missingColumns = @('SubscriptionId', 'ResourceGroup', 'VMName', 'MetricGaps' | Where-Object { $resumeRows.Count -gt 0 -and $_ -notin $resumeRows[0].PSObject.Properties.Name })
+        if ($missingColumns.Count -gt 0) { throw "it has no $($missingColumns -join ', ') column, so it is not a VM_Metrics file written by this version of the script" }
+
+        # With -IncludeAvailability a VM is only skipped when its availability row was saved as well
+        $resumeAvailability = @{}
+        if ($IncludeAvailability) {
+            $resumeAvailPath = Join-Path -Path (Split-Path -Parent $resumePath) -ChildPath ((Split-Path -Leaf $resumePath) -replace '^VM_Metrics_', 'VM_Availability_')
+            if ($resumeAvailPath -ne $resumePath -and (Test-Path -LiteralPath $resumeAvailPath)) {
+                foreach ($row in @(Import-Csv -LiteralPath $resumeAvailPath -ErrorAction Stop)) { $resumeAvailability["$($row.SubscriptionId)|$($row.ResourceGroup)|$($row.VMName)"] = $row }
+            } else {
+                Write-Warning "-IncludeAvailability is set but no matching VM_Availability file was found next to '$resumePath', so every VM is fetched again."
+            }
+        }
+    } catch {
+        Write-Error "Cannot resume from '$ResumeFrom': $($_.Exception.Message)"
+        if ($transcriptPath) { try { Stop-Transcript | Out-Null } catch {} }
+        exit 1
+    }
+
+    foreach ($row in $resumeRows) {
+        $key = "$($row.SubscriptionId)|$($row.ResourceGroup)|$($row.VMName)"
+        if ($row.MetricGaps) { continue }
+        if ($IncludeAvailability -and -not $resumeAvailability.ContainsKey($key)) { continue }
+        if (-not $resumedKeys.Add($key)) { continue }
+        # Import-Csv reads an empty field as '', which Export-Csv would write back as "" rather than as
+        # the bare empty field a missing value gets; the upload-read columns only ever hold a value or nothing
+        $kept = @($row) + @(if ($IncludeAvailability) { $resumeAvailability[$key] })
+        foreach ($keptRow in $kept) {
+            foreach ($property in $keptRow.PSObject.Properties) { if ($property.Value -eq '') { $property.Value = $null } }
+        }
+        $metricsResults.Add($row)
+        if ($IncludeAvailability) { $availabilityResults.Add($resumeAvailability[$key]) }
+    }
+    Add-PartialRows -Rows $metricsResults -Path $metricsPartialPath
+    Add-PartialRows -Rows $availabilityResults -Path $availPartialPath
+    Write-Host "Resuming from $($resumePath): $($resumedKeys.Count) of $($resumeRows.Count) row(s) are complete and kept; those VMs are not fetched again." -ForegroundColor Yellow
+}
+
 # ----- Gaining Auth & Context -----
 $connectArgs = @{}
 if ($TenantId) { $connectArgs['TenantId'] = $TenantId }
@@ -771,11 +825,14 @@ foreach ($subscription in $subscriptions) {
     if ($VMNames) {
         $vms = @($vms | Where-Object { $VMNames -contains $_.Name })
     }
+    if ($resumedKeys.Count -gt 0) {
+        $vms = @($vms | Where-Object { -not $resumedKeys.Contains("$($subscription.Id)|$($_.ResourceGroupName)|$($_.Name)") })
+    }
 
     $totalVMs += @($vms).Count
 }
 
-if ($totalVMs -eq 0) {
+if ($totalVMs -eq 0 -and $resumedKeys.Count -eq 0) {
     if ($VMNames) {
         Write-Warning "None of the requested VMs were found in any in-scope subscription."
         Write-Host "VMs requested: $($VMNames -join ', ')" -ForegroundColor Yellow
@@ -815,6 +872,11 @@ foreach ($subscription in $subscriptions) {
 
         if ($VMNames) {
             $vms = @($vms | Where-Object { $VMNames -contains $_.Name })
+        }
+        if ($resumedKeys.Count -gt 0) {
+            $listed = @($vms).Count
+            $vms = @($vms | Where-Object { -not $resumedKeys.Contains("$($subscription.Id)|$($_.ResourceGroupName)|$($_.Name)") })
+            if ($listed -gt $vms.Count) { Write-Host "$($listed - $vms.Count) VM(s) already collected in the resumed run are skipped." -ForegroundColor Yellow }
         }
 
         if (-not $vms -or @($vms).Count -eq 0) {
@@ -1234,13 +1296,20 @@ try {
         Write-Host "=====================================" -ForegroundColor Red
         if ($stoppedEarly) { Write-Warning "The run stopped early because the sign-in lapsed; VMs after the last saved batch are missing." }
         if ($failedSubscriptions.Count -gt 0) { Write-Warning "Subscription(s) that failed part-way or entirely: $($failedSubscriptions -join ', ') (see errors above)." }
-        Write-Warning "Re-run for the missing subscriptions with -SubscriptionIds. The .partial.csv files are kept; send them with the log."
+        if (Test-Path -LiteralPath $metricsPartialPath) {
+            Write-Warning "The .partial.csv files are kept. To collect only what is missing, run again with -ResumeFrom '$metricsPartialPath'; if that fails too, send the files with the log."
+        } else {
+            Write-Warning "Re-run for the missing subscriptions with -SubscriptionIds."
+        }
     } else {
         Write-Host "=====================================" -ForegroundColor Green
         Write-Host "Export Complete!" -ForegroundColor Green
         Write-Host "=====================================" -ForegroundColor Green
     }
     Write-Host "Total VMs processed: $processedVMs of $totalVMs" -ForegroundColor Yellow
+    if ($resumedKeys.Count -gt 0) {
+        Write-Host "VMs kept from the resumed run: $($resumedKeys.Count)" -ForegroundColor Yellow
+    }
     if ($skippedScaleSets -gt 0) {
         Write-Host "Uniform scale sets not included: $skippedScaleSets (see warnings above)" -ForegroundColor Yellow
     }

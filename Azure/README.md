@@ -59,6 +59,7 @@ pwsh -File ./metrics_availability_assessment.ps1 -OutputPath ~/assessments
 | `-TenantId` | current context | Restrict to a specific tenant. |
 | `-SubscriptionIds` | all | Comma-separated subscription IDs to include. Use it to split a large tenant into several shorter runs. |
 | `-VMNames` | all | Comma-separated VM names to include. |
+| `-ResumeFrom` | none | Path to an earlier run's `VM_Metrics_….partial.csv` (or `.csv`). Complete rows are kept and those VMs are skipped; see [Output](#output). |
 | `-UseDeviceAuthentication` | off | Device-code login for headless / SSH sessions. |
 | `-SkipModuleCheck` | off | Skip auto-install of Az modules (faster on warm machines, or if a corporate policy blocks `Install-Module`). |
 
@@ -74,8 +75,14 @@ While the run is in progress, rows are also appended to `VM_Metrics_yyyyMMdd_HHm
 (and `VM_Availability_…partial.csv`) as each batch of 25 VMs finishes. A complete run deletes them
 once the final files are written. If a run stops part-way (laptop asleep, VPN dropped, window
 closed), the `.partial.csv` holds every VM collected so far: send it with the log. A run that ends
-with **Export INCOMPLETE** (the sign-in lapsed, or a subscription failed part-way) also keeps them,
-and names the subscriptions to re-run with `-SubscriptionIds`.
+with **Export INCOMPLETE** (the sign-in lapsed, or a subscription failed part-way) also keeps them.
+
+To pick up where a run stopped, run again with `-ResumeFrom <path to the VM_Metrics_….partial.csv>`.
+VMs with a complete row in that file are not fetched again and their rows are carried into the new
+output; VMs whose row has `MetricGaps`, and VMs not in the file, are fetched. The same works with a
+finished `VM_Metrics_….csv`, to fetch only the VMs that had gaps. Carried rows keep their own
+`CollectionStartDate` / `CollectionEndDate`, so one file can then hold rows from two collection
+windows. Resume only from a file written by the same version of the script.
 
 > **Transcript may contain sensitive details.** The `.log` is a verbatim transcript of the
 > console session, so beyond the data in the CSVs it can capture the signed-in account
