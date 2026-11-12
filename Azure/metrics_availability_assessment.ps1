@@ -239,6 +239,9 @@ function Get-MetricData {
     # all its attempts, the VM's remaining requests get a single attempt, so a throttled or failing
     # Azure Monitor can't hold one VM for hours
     $waitBudget = 600
+    # End of the last Retry-After wait Azure asked for. Once the wait budget is spent the VM no longer
+    # waits, so until then its requests are not sent at all: they would be rejected and add to the throttling
+    $throttledUntil = [datetime]::MinValue
     $addGap = {
         param([string[]]$GapNames)
         foreach ($gapName in $GapNames) {
@@ -265,6 +268,12 @@ function Get-MetricData {
                     "&metricnames=$(($batch | ForEach-Object { [uri]::EscapeDataString($_) }) -join ',')" +
                     "&timespan=$timespan&interval=PT5M&aggregation=$($aggregation.ToLower())"
 
+                if ($waitBudget -le 0 -and [datetime]::UtcNow -lt $throttledUntil) {
+                    & $addGap $batch
+                    Write-Verbose "Metrics request for '$($batch -join ', ')' not sent: Azure asked to wait and this VM's wait budget is spent; chunk $chunkCount left empty."
+                    continue
+                }
+
                 # Up to 6 attempts on throttling, server errors, timeouts and unreadable replies, waiting as
                 # long as Retry-After asks (at most 5 minutes) while the VM's wait budget lasts
                 $response = $null
@@ -277,6 +286,7 @@ function Get-MetricData {
                         $retryAfter = 0
                         if ($web.Headers -and $web.Headers.ContainsKey('Retry-After') -and [int]::TryParse("$($web.Headers['Retry-After'])", [ref]$retryAfter) -and $retryAfter -gt 0) {
                             $wait = $retryAfter
+                            if ($response.StatusCode -eq 429 -or $response.StatusCode -ge 500) { $throttledUntil = [datetime]::UtcNow.AddSeconds([math]::Min(300, $retryAfter)) }
                         }
                         # A cut-off 200 body is a failed attempt, not a reason to lose the VM
                         if ($response.StatusCode -eq 200) { $parsed = $response.Content | ConvertFrom-Json -ErrorAction Stop }
