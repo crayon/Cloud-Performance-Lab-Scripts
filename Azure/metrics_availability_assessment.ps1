@@ -1240,9 +1240,3 @@ Write-Host "Script execution completed." -ForegroundColor Cyan
 if ($transcriptPath) {
     try { Stop-Transcript | Out-Null } catch {}
 }
-
-<#
-.NOTES
-Performance: if the script is running too slowly, or hit API limits,
-you might have to increase -TimeGrain value. Current value set for 5min 00:05:00, which produces the most accurate results for Avg values.
-#>
