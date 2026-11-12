@@ -101,6 +101,12 @@ if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
     exit 1
 }
 
+# Before 7.4 a metrics download that stalls part-way cannot be timed out, and would hang the run
+if ($PSVersionTable.PSVersion -lt [version]'7.4') {
+    Write-Warning ("PowerShell $($PSVersionTable.PSVersion) cannot time out a metrics download that stalls part-way (e.g. after a VPN drop or laptop sleep), " +
+        "so the run could hang. PowerShell 7.4 or later is recommended for large tenants.")
+}
+
 # pwsh -File passes "-SubscriptionIds a,b" as the single string "a,b", so split the lists here
 $SubscriptionIds = @($SubscriptionIds | ForEach-Object { "$_" -split ',' } | ForEach-Object Trim | Where-Object { $_ })
 $VMNames = @($VMNames | ForEach-Object { "$_" -split ',' } | ForEach-Object Trim | Where-Object { $_ })
@@ -230,6 +236,10 @@ function Get-MetricData {
     $StartTime = $StartTime.AddTicks(-($StartTime.Ticks % [timespan]::FromMinutes(5).Ticks))
     $EndTime = $EndTime.ToUniversalTime()
 
+    # -TimeoutSec only covers connecting and the response headers. A body that stops arriving part-way
+    # would block this VM, and with it the run, for good; PowerShell 7.4+ can time that out as well
+    $readTimeout = if ($PSVersionTable.PSVersion -ge [version]'7.4') { @{ OperationTimeoutSeconds = 120 } } else { @{} }
+
     $data = @{}
     $gaps = @{}
     $chunkCount = 0
@@ -281,7 +291,7 @@ function Get-MetricData {
                 for ($attempt = 1; $attempt -le 6; $attempt++) {
                     $wait = [math]::Pow(2, $attempt)
                     try {
-                        $web = Invoke-WebRequest -Uri "$($ResourceManagerUrl.TrimEnd('/'))$path" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 120 -SkipHttpErrorCheck -ErrorAction Stop
+                        $web = Invoke-WebRequest -Uri "$($ResourceManagerUrl.TrimEnd('/'))$path" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 120 @readTimeout -SkipHttpErrorCheck -ErrorAction Stop
                         $response = [pscustomobject]@{ StatusCode = [int]$web.StatusCode; Content = "$($web.Content)" }
                         $retryAfter = 0
                         if ($web.Headers -and $web.Headers.ContainsKey('Retry-After') -and [int]::TryParse("$($web.Headers['Retry-After'])", [ref]$retryAfter) -and $retryAfter -gt 0) {
